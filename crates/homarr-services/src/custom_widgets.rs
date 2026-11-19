@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use homarr_auth::{check_integration_permission, AuthSession};
 use homarr_common::{HomarrError, HomarrResult, SecretCrypto};
 use homarr_core::{AppConfig, HttpClientFactory};
 use homarr_db::{repos::custom_widgets as cw_repo, Database};
+use homarr_definitions::IntegrationPermission;
 use homarr_integrations::{IntegrationContext, IntegrationRegistry};
 use regex::Regex;
 use reqwest::Method;
@@ -51,11 +53,14 @@ impl CustomWidgetService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_request(
         &self,
         db: &Database,
         crypto: &SecretCrypto,
         integrations: &IntegrationRegistry,
+        // None only for options loaded from stored board items; API callers must pass their session.
+        session: Option<&AuthSession>,
         definition_id: &str,
         request_id: &str,
         options: &HashMap<String, Value>,
@@ -126,6 +131,16 @@ impl CustomWidgetService {
                 .and_then(|v| v.as_str())
                 .or_else(|| source_spec.get("integrationId").and_then(|v| v.as_str()))
                 .ok_or_else(|| HomarrError::BadRequest("Integration ID is required".into()))?;
+            // The caller may pick the integration through options, so they must be allowed to use it.
+            if let Some(session) = session {
+                check_integration_permission(
+                    db,
+                    session,
+                    integration_id,
+                    IntegrationPermission::Use,
+                )
+                .await?;
+            }
             let integration = homarr_db::repos::integrations::get_by_id(db, integration_id)
                 .await?
                 .ok_or_else(|| HomarrError::NotFound("Integration not found".into()))?;
@@ -167,6 +182,19 @@ impl CustomWidgetService {
             )
         };
 
+        // Options are caller-controlled; never let them move the source's secrets to another origin.
+        let source_origin = url::Url::parse(base_url)
+            .map_err(|e| HomarrError::BadRequest(format!("Invalid source url: {e}")))?
+            .origin();
+        let target_origin = url::Url::parse(&full_url)
+            .map_err(|e| HomarrError::BadRequest(format!("Invalid request url: {e}")))?
+            .origin();
+        if source_origin != target_origin {
+            return Err(HomarrError::Forbidden(
+                "Custom widget request must stay on its source origin".into(),
+            ));
+        }
+
         let mut headers = HashMap::new();
         if let Some(bearer) = secrets.get("bearerToken") {
             headers.insert("Authorization".to_string(), format!("Bearer {bearer}"));
@@ -194,7 +222,7 @@ impl CustomWidgetService {
         let req_method = Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
             .map_err(|_| HomarrError::BadRequest(format!("Invalid HTTP method '{method}'")))?;
         let _ = homarr_common::validate_outbound_url(&full_url, None)?;
-        let mut req = self.http.standard().request(req_method, &full_url);
+        let mut req = self.http.guarded().request(req_method, &full_url);
         for (k, v) in headers {
             req = req.header(k, v);
         }

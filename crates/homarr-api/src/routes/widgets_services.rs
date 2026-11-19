@@ -6,10 +6,12 @@ use axum::{
     response::Html,
     Json,
 };
-use homarr_auth::{OptionalAuth, RequireAdmin, RequireAuth};
+use homarr_auth::{
+    check_integration_permission, AuthSession, OptionalAuth, RequireAdmin, RequireAuth,
+};
 use homarr_common::{HomarrError, HomarrResult};
 use homarr_db::repos::custom_widgets::{self as cw_repo, CustomWidgetV2Input};
-use homarr_definitions::WidgetKind;
+use homarr_definitions::{IntegrationPermission, WidgetKind};
 use homarr_services::validate_custom_widget_definition;
 use homarr_widgets::{all_widget_metadata, get_widget_metadata, render_widget_html};
 use serde::Deserialize;
@@ -29,7 +31,34 @@ pub struct RenderWidgetQuery {
     pub options: Option<String>,
 }
 
+/// Widget data endpoints take integration IDs from the caller, so each one must be usable by them.
+/// Custom API widgets also read `options.integrationId` and run stored requests, so they need a session.
+async fn authorize_integrations(
+    state: &AppState,
+    session: Option<&AuthSession>,
+    kind: WidgetKind,
+    options: &Value,
+    integration_ids: &[String],
+) -> HomarrResult<()> {
+    let option_integration = options.get("integrationId").and_then(Value::as_str);
+    if integration_ids.is_empty() && option_integration.is_none() && kind != WidgetKind::CustomApi {
+        return Ok(());
+    }
+    let session = session.ok_or_else(|| {
+        HomarrError::Unauthorized("Authentication required to use integrations".into())
+    })?;
+    for id in integration_ids
+        .iter()
+        .map(String::as_str)
+        .chain(option_integration)
+    {
+        check_integration_permission(&state.db, session, id, IntegrationPermission::Use).await?;
+    }
+    Ok(())
+}
+
 pub async fn render_widget(
+    OptionalAuth(session): OptionalAuth,
     State(state): State<AppState>,
     Path(kind_str): Path<String>,
     Query(q): Query<RenderWidgetQuery>,
@@ -52,6 +81,7 @@ pub async fn render_widget(
                 .collect()
         })
         .unwrap_or_default();
+    authorize_integrations(&state, session.as_ref(), kind, &options, &integration_ids).await?;
     let data = state
         .widgets
         .resolve_widget_data(kind, &options, &integration_ids)
@@ -71,12 +101,20 @@ pub struct ResolveWidgetBody {
 }
 
 pub async fn resolve_widget(
-    OptionalAuth(_session): OptionalAuth,
+    OptionalAuth(session): OptionalAuth,
     State(state): State<AppState>,
     Json(body): Json<ResolveWidgetBody>,
 ) -> HomarrResult<Json<Value>> {
     let kind = WidgetKind::from_str_opt(&body.kind)
         .ok_or_else(|| HomarrError::BadRequest(format!("Unknown widget kind '{}'", body.kind)))?;
+    authorize_integrations(
+        &state,
+        session.as_ref(),
+        kind,
+        &body.options,
+        &body.integration_ids,
+    )
+    .await?;
     let data = state
         .widgets
         .resolve_widget_data(kind, &body.options, &body.integration_ids)
@@ -248,7 +286,7 @@ pub struct ExecuteCwBody {
 }
 
 pub async fn execute_custom_widget(
-    RequireAuth(_session): RequireAuth,
+    RequireAuth(session): RequireAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<ExecuteCwBody>,
@@ -260,6 +298,7 @@ pub async fn execute_custom_widget(
             &state.db,
             &state.crypto,
             &state.integrations,
+            Some(&session),
             &id,
             &body.request_id,
             &body.options,

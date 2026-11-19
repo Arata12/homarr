@@ -1,7 +1,9 @@
-use axum::extract::FromRequestParts;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::header::{AUTHORIZATION, COOKIE};
 use axum::http::request::Parts;
-use homarr_common::HomarrError;
+use homarr_common::{ip_matches_any, HomarrError};
 use homarr_core::AppConfig;
 use homarr_db::{repos, Database};
 use homarr_definitions::GroupPermissionKey;
@@ -70,12 +72,19 @@ async fn resolve_session<S: AuthContextProvider>(
         }
     }
 
-    // 4. Check trusted proxy header if configured
+    // 4. Check trusted proxy header if configured, only from an allowed proxy peer address
     if let Some(ref header_name) = state.config().auth_trusted_proxy_header {
+        let peer_trusted = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|ConnectInfo(addr)| {
+                ip_matches_any(addr.ip(), &state.config().auth_trusted_proxy_ips)
+            });
         if let Some(username) = parts
             .headers
             .get(header_name.as_str())
             .and_then(|v| v.to_str().ok())
+            .filter(|_| peer_trusted)
         {
             if let Some(user) = repos::users::find_by_name_ci(state.db(), username).await? {
                 let permissions = repos::groups::get_user_permissions(state.db(), &user.id).await?;

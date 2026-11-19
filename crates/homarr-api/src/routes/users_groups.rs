@@ -38,9 +38,9 @@ pub async fn create_user(
 ) -> HomarrResult<(StatusCode, Json<Value>)> {
     admin.require_writable(state.demo_read_only_active())?;
     let name = body.name.trim().to_string();
-    if name.len() < 2 || body.password.len() < 4 {
+    if name.len() < 2 || body.password.chars().count() < 8 {
         return Err(HomarrError::BadRequest(
-            "Username must be >= 2 chars and password >= 4 chars".into(),
+            "Username must be >= 2 chars and password >= 8 chars".into(),
         ));
     }
     if users::find_by_name_ci(&state.db, &name).await?.is_some() {
@@ -107,6 +107,11 @@ pub async fn update_user(
     )
     .await?;
     if let Some(pw) = body.password.filter(|p| !p.is_empty()) {
+        if pw.chars().count() < 8 {
+            return Err(HomarrError::BadRequest(
+                "Password must be >= 8 chars".into(),
+            ));
+        }
         let hash = hash_password(&pw).await?;
         users::update_password(&state.db, &id, &hash).await?;
     }

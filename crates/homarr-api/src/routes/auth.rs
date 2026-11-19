@@ -19,6 +19,8 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
+static REGISTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginBody {
@@ -48,6 +50,11 @@ pub async fn login(
         &state.config.auth_cookie_prefix,
         token,
         state.config.auth_session_expiry_secs,
+        state
+            .config
+            .base_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("https://")),
     );
 
     let mut headers = HeaderMap::new();
@@ -118,12 +125,16 @@ pub async fn register(
     Json(body): Json<RegisterBody>,
 ) -> HomarrResult<impl IntoResponse> {
     let username = body.name.trim().to_string();
-    if username.len() < 2 || body.password.len() < 4 {
+    if username.len() < 2 || body.password.chars().count() < 8 {
         return Err(HomarrError::BadRequest(
-            "Username must be >= 2 chars and password >= 4 chars".into(),
+            "Username must be >= 2 chars and password >= 8 chars".into(),
         ));
     }
 
+    // Serializes the first-admin check and invite consumption so concurrent requests cannot
+    // both become admin or reuse one invite.
+    // shortcut: process-local lock, needs a DB-level guard if Homarr ever runs multiple replicas.
+    let _register_guard = REGISTER_LOCK.lock().await;
     let existing_count = users::count(&state.db).await?;
     let mut invite_id_to_delete = None;
 
@@ -191,6 +202,11 @@ pub async fn register(
         &state.config.auth_cookie_prefix,
         token,
         state.config.auth_session_expiry_secs,
+        state
+            .config
+            .base_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("https://")),
     );
     let mut headers = HeaderMap::new();
     if let Ok(hv) = HeaderValue::from_str(&cookie) {

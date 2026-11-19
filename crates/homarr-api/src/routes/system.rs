@@ -5,12 +5,12 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use homarr_auth::{RequireAdmin, RequireAuth};
+use homarr_auth::{OptionalAuth, RequireAdmin, RequireAuth};
 use homarr_common::{HomarrError, HomarrResult};
 use homarr_db::{
     backup::{export_backup_json, import_backup_json, HomarrBackupBundle},
     models::AssistantConfigRecord,
-    repos::{assistant, settings},
+    repos::{assistant, settings, users},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -55,11 +55,18 @@ pub struct OnboardingBody {
 }
 
 pub async fn update_onboarding(
+    OptionalAuth(session): OptionalAuth,
     State(state): State<AppState>,
     Json(body): Json<OnboardingBody>,
 ) -> HomarrResult<Json<Value>> {
     if state.demo_read_only_active() {
         return Err(HomarrError::Forbidden("Demo mode is read-only".into()));
+    }
+    // Anonymous onboarding is only allowed before the first user exists.
+    if users::count(&state.db).await? > 0 {
+        let session =
+            session.ok_or_else(|| HomarrError::Unauthorized("Authentication required".into()))?;
+        session.require_permission(homarr_definitions::GroupPermissionKey::Admin)?;
     }
     let rec =
         settings::set_onboarding(&state.db, &body.step, body.previous_step.as_deref()).await?;

@@ -185,6 +185,41 @@ pub fn validate_outbound_url(raw: &str, trusted_origin: Option<&str>) -> HomarrR
     Ok(url)
 }
 
+/// Returns true when `ip` matches any entry in `allowed` (plain IPs or CIDR ranges such as
+/// `172.18.0.0/16`). Malformed entries never match.
+pub fn ip_matches_any(ip: IpAddr, allowed: &[String]) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    allowed.iter().any(|entry| {
+        let (addr, prefix) = match entry.split_once('/') {
+            Some((a, p)) => (a, p.parse::<u32>().ok()),
+            None => (entry.as_str(), None),
+        };
+        match (addr.trim().parse::<IpAddr>(), ip) {
+            (Ok(IpAddr::V4(net)), IpAddr::V4(ip)) => {
+                let bits = prefix.unwrap_or(32);
+                bits <= 32 && {
+                    let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+                    u32::from(net) & mask == u32::from(ip) & mask
+                }
+            }
+            (Ok(IpAddr::V6(net)), IpAddr::V6(ip)) => {
+                let bits = prefix.unwrap_or(128);
+                bits <= 128 && {
+                    let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+                    u128::from(net) & mask == u128::from(ip) & mask
+                }
+            }
+            _ => false,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +238,30 @@ mod tests {
         assert!(!is_blocked_ip("10.0.0.15".parse().unwrap()));
         assert!(!is_blocked_ip("172.17.0.2".parse().unwrap()));
         assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn ip_matches_plain_and_cidr_entries() {
+        let allowed = vec![
+            "10.0.0.5".to_string(),
+            "172.18.0.0/16".to_string(),
+            "fd00::/8".to_string(),
+            "bogus".to_string(),
+        ];
+        assert!(ip_matches_any("10.0.0.5".parse().unwrap(), &allowed));
+        assert!(!ip_matches_any("10.0.0.6".parse().unwrap(), &allowed));
+        assert!(ip_matches_any("172.18.3.4".parse().unwrap(), &allowed));
+        assert!(ip_matches_any(
+            "::ffff:172.18.3.4".parse().unwrap(),
+            &allowed
+        ));
+        assert!(!ip_matches_any("172.19.0.1".parse().unwrap(), &allowed));
+        assert!(ip_matches_any("fd12::1".parse().unwrap(), &allowed));
+        assert!(!ip_matches_any("8.8.8.8".parse().unwrap(), &[]));
+        assert!(ip_matches_any(
+            "8.8.8.8".parse().unwrap(),
+            &["0.0.0.0/0".to_string()]
+        ));
     }
 
     #[test]

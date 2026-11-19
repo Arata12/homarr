@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use homarr_common::{is_blocked_ip, validate_outbound_url, HomarrError, HomarrResult};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Response};
 use url::Url;
@@ -11,10 +14,31 @@ use crate::certificates::CertificateManager;
 
 const MAX_REDIRECTS: usize = 5;
 
+/// Resolver that drops blocked addresses at connect time, so a DNS answer cannot change
+/// between the pre-flight check and the actual connection (DNS rebinding).
+struct BlockedIpFilteringResolver;
+
+impl Resolve for BlockedIpFilteringResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|addr| !is_blocked_ip(addr.ip()))
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("{host} resolves only to blocked addresses").into());
+            }
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpClientFactory {
     standard: Client,
     no_redirect: Client,
+    guarded: Client,
     ping: Client,
 }
 
@@ -38,9 +62,19 @@ impl HttpClientFactory {
             .connect_timeout(Duration::from_secs(10))
             .redirect(Policy::none())
             .user_agent(concat!("Homarr/", env!("CARGO_PKG_VERSION")));
+        let mut guarded_builder = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(Policy::none())
+            .dns_resolver(Arc::new(BlockedIpFilteringResolver))
+            .user_agent(concat!("Homarr/", env!("CARGO_PKG_VERSION")));
         for cert in extra_certs {
-            no_redirect_builder = no_redirect_builder.add_root_certificate(cert);
+            no_redirect_builder = no_redirect_builder.add_root_certificate(cert.clone());
+            guarded_builder = guarded_builder.add_root_certificate(cert);
         }
+        let guarded = guarded_builder.build().map_err(|err| {
+            HomarrError::Internal(format!("Failed to build guarded HTTP client: {err}"))
+        })?;
         let no_redirect = no_redirect_builder.build().map_err(|err| {
             HomarrError::Internal(format!("Failed to build guarded HTTP client: {err}"))
         })?;
@@ -56,12 +90,18 @@ impl HttpClientFactory {
         Ok(Self {
             standard,
             no_redirect,
+            guarded,
             ping,
         })
     }
 
     pub fn standard(&self) -> &Client {
         &self.standard
+    }
+
+    /// Client for untrusted URLs: no redirects, blocked IPs filtered at connect time.
+    pub fn guarded(&self) -> &Client {
+        &self.guarded
     }
 
     pub fn ping(&self) -> &Client {
@@ -88,7 +128,12 @@ impl HttpClientFactory {
                 verify_dns_targets(&current_url).await?;
             }
 
-            let mut req = self.no_redirect.get(current_url.clone());
+            let client = if is_trusted {
+                &self.no_redirect
+            } else {
+                &self.guarded
+            };
+            let mut req = client.get(current_url.clone());
             if let Some(ref headers) = current_headers {
                 for (k, v) in headers {
                     req = req.header(k, v);

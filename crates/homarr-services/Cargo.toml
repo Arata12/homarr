@@ -11,6 +11,7 @@ bollard.workspace = true
 cbc.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+homarr-auth.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 hmac.workspace = true

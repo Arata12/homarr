@@ -1269,6 +1269,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "homarr-auth",
  "homarr-common",
  "homarr-core",
  "homarr-db",

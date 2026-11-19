@@ -332,9 +332,14 @@ mod tests {
     use tower::ServiceExt;
 
     async fn setup_test_state() -> (AppState, Router) {
+        setup_test_state_with(|_| {}).await
+    }
+
+    async fn setup_test_state_with(configure: impl FnOnce(&mut AppConfig)) -> (AppState, Router) {
         let mut cfg = AppConfig::for_test();
         cfg.demo_mode = true;
         cfg.demo_read_only = false;
+        configure(&mut cfg);
         let certs = CertificateManager::new(cfg.local_certificate_path.clone());
         let http = HttpClientFactory::new(&certs).unwrap();
         let db = Database::connect(DatabaseDriver::Sqlite, "sqlite::memory:")
@@ -516,5 +521,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ws_resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    async fn status_and_json(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn anonymous_callers_cannot_use_integrations_or_onboarding() {
+        let (state, app) = setup_test_state().await;
+        let integration_id = repos::integrations::list_all(&state.db)
+            .await
+            .unwrap()
+            .first()
+            .expect("demo seed creates an integration")
+            .id
+            .clone();
+
+        let resolve = |body: Value| {
+            Request::post("/api/widgets/resolve")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (status, _) = status_and_json(
+            &app,
+            resolve(json!({ "kind": "clock", "integrationIds": [integration_id] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) = status_and_json(
+            &app,
+            resolve(json!({ "kind": "clock", "options": { "integrationId": integration_id } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) = status_and_json(&app, resolve(json!({ "kind": "clock" }))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = status_and_json(
+            &app,
+            Request::get(format!(
+                "/api/widgets/render/clock?integrationIds={integration_id}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) = status_and_json(
+            &app,
+            Request::post("/api/onboarding")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"step":"finish"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_header_requires_allowed_peer_address() {
+        let (_state, app) = setup_test_state_with(|cfg| {
+            cfg.auth_trusted_proxy_header = Some("Remote-User".to_string());
+            cfg.auth_trusted_proxy_ips = vec!["10.0.0.0/8".to_string()];
+        })
+        .await;
+        let request_from = |peer: Option<&str>| {
+            let mut req = Request::get("/api/auth/session")
+                .header("Remote-User", "demo")
+                .body(Body::empty())
+                .unwrap();
+            if let Some(peer) = peer {
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                        peer.parse().unwrap(),
+                    ));
+            }
+            req
+        };
+
+        let (_, body) = status_and_json(&app, request_from(None)).await;
+        assert_eq!(body["authenticated"], false);
+        let (_, body) = status_and_json(&app, request_from(Some("203.0.113.9:4000"))).await;
+        assert_eq!(body["authenticated"], false);
+        let (_, body) = status_and_json(&app, request_from(Some("10.1.2.3:4000"))).await;
+        assert_eq!(body["authenticated"], true);
     }
 }

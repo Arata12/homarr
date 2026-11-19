@@ -8,8 +8,10 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{PgPool, SqlitePool};
 
-const SQLITE_INITIAL_SQL: &str = include_str!("../../../migrations/sqlite/0001_initial.sql");
-const POSTGRES_INITIAL_SQL: &str = include_str!("../../../migrations/postgres/0001_initial.sql");
+// Versioned migrations tracked in `_sqlx_migrations`. 0001 is idempotent, so databases created
+// before versioning was introduced adopt it without changes. Add new files as 0002_*, 0003_*...
+static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/sqlite");
+static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/postgres");
 
 #[derive(Clone)]
 pub enum Database {
@@ -73,19 +75,37 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> HomarrResult<()> {
-        match self {
-            Self::Sqlite(pool) => {
-                sqlx::raw_sql(SQLITE_INITIAL_SQL)
-                    .execute(pool)
-                    .await
-                    .map_err(map_sqlx_err)?;
-            }
-            Self::Postgres(pool) => {
-                sqlx::raw_sql(POSTGRES_INITIAL_SQL)
-                    .execute(pool)
-                    .await
-                    .map_err(map_sqlx_err)?;
-            }
+        self.ensure_not_legacy_database().await?;
+        let result = match self {
+            Self::Sqlite(pool) => SQLITE_MIGRATOR.run(pool).await,
+            Self::Postgres(pool) => POSTGRES_MIGRATOR.run(pool).await,
+        };
+        result.map_err(|err| HomarrError::Internal(format!("Database migration failed: {err}")))
+    }
+
+    /// Homarr v1 (Next.js/Drizzle) databases have a different schema; running the v3 schema with
+    /// `IF NOT EXISTS` over them would silently leave mismatched tables, so refuse to start.
+    async fn ensure_not_legacy_database(&self) -> HomarrResult<()> {
+        let legacy_tables: i64 = match self {
+            Self::Sqlite(pool) => sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '__drizzle_migrations'",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_err)?,
+            Self::Postgres(pool) => sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '__drizzle_migrations'",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_err)?,
+        };
+        if legacy_tables > 0 {
+            return Err(HomarrError::Internal(
+                "This database was created by Homarr v1 (Drizzle migrations found) and is not compatible \
+                 with Homarr v3. Point DB_URL at a new database for v3."
+                    .to_string(),
+            ));
         }
         Ok(())
     }

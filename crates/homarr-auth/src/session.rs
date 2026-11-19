@@ -52,10 +52,17 @@ pub async fn delete_session(db: &Database, token: &str) -> HomarrResult<()> {
     repos::sessions::delete_by_token(db, token).await
 }
 
-pub fn build_session_cookie(cookie_prefix: &str, token: String, max_age_secs: i64) -> String {
+/// `secure` should be true when Homarr is served over HTTPS (e.g. `BASE_URL` starts with `https://`).
+pub fn build_session_cookie(
+    cookie_prefix: &str,
+    token: String,
+    max_age_secs: i64,
+    secure: bool,
+) -> String {
     format!(
-        "{}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}",
-        session_cookie_name(cookie_prefix)
+        "{}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{}",
+        session_cookie_name(cookie_prefix),
+        if secure { "; Secure" } else { "" }
     )
 }
 
