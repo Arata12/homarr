@@ -1,0 +1,20 @@
+[package]
+name = "homarr-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes.workspace = true
+axum.workspace = true
+cbc.workspace = true
+cuid2.workspace = true
+hex.workspace = true
+hmac.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+url.workspace = true

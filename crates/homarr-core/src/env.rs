@@ -1,0 +1,315 @@
+use std::path::PathBuf;
+
+use homarr_common::{generate_secure_random_token, HomarrError, HomarrResult};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseDriver {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub host: String,
+    pub port: u16,
+    pub base_url: Option<String>,
+    pub db_driver: DatabaseDriver,
+    pub db_url: String,
+    pub secret_encryption_key: String,
+    pub auth_secret: String,
+    pub auth_cookie_prefix: String,
+    pub auth_providers: Vec<String>,
+    pub auth_session_expiry_secs: i64,
+    pub auth_trusted_proxy_header: Option<String>,
+    pub redis_is_external: bool,
+    pub redis_host: String,
+    pub redis_port: u16,
+    pub redis_username: Option<String>,
+    pub redis_password: Option<String>,
+    pub redis_db: i64,
+    pub redis_disabled: bool,
+    pub log_level: String,
+    pub local_certificate_path: PathBuf,
+    pub docker_socket_paths: Vec<String>,
+    pub docker_hostnames: Vec<String>,
+    pub docker_ports: Vec<u16>,
+    pub enable_kubernetes: bool,
+    pub demo_mode: bool,
+    pub demo_read_only: bool,
+    pub unsafe_enable_mock_integration: bool,
+    pub no_external_connection: bool,
+    pub workshop_api_url: String,
+    pub workshop_web_url: String,
+    pub assets_dir: PathBuf,
+    pub static_data_dir: PathBuf,
+    pub homarr_request_identity_secret: Option<String>,
+}
+
+fn parse_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(val) => matches!(
+            val.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+fn parse_csv(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+impl AppConfig {
+    pub fn from_env() -> HomarrResult<Self> {
+        let dialect_raw = non_empty_env("DB_DIALECT")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let driver_raw = non_empty_env("DB_DRIVER")
+            .unwrap_or_else(|| "sqlite".to_string())
+            .to_ascii_lowercase();
+        let url_raw = non_empty_env("DB_URL");
+
+        if matches!(dialect_raw.as_str(), "mysql" | "mariadb")
+            || matches!(driver_raw.as_str(), "mysql" | "mysql2" | "mariadb")
+            || url_raw
+                .as_deref()
+                .map(|u| {
+                    let lower = u.to_ascii_lowercase();
+                    lower.starts_with("mysql:") || lower.starts_with("mariadb:")
+                })
+                .unwrap_or(false)
+        {
+            return Err(HomarrError::BadRequest(
+                "MySQL and MariaDB are no longer supported in Homarr v2. Migrate your database to SQLite or PostgreSQL before starting Homarr.".to_string(),
+            ));
+        }
+
+        let db_driver = match driver_raw.as_str() {
+            "sqlite" | "better-sqlite3" => DatabaseDriver::Sqlite,
+            "postgres" | "postgresql" | "node-postgres" => DatabaseDriver::Postgres,
+            other => {
+                return Err(HomarrError::BadRequest(format!(
+                    "Invalid DB_DRIVER '{other}', supported values are sqlite, better-sqlite3, postgres, postgresql, node-postgres"
+                )));
+            }
+        };
+
+        let db_url = match (db_driver, url_raw) {
+            (DatabaseDriver::Sqlite, Some(u)) => u,
+            (DatabaseDriver::Sqlite, None) => "/appdata/db/db.sqlite".to_string(),
+            (DatabaseDriver::Postgres, Some(u)) => u,
+            (DatabaseDriver::Postgres, None) => {
+                let host = non_empty_env("DB_HOST").ok_or_else(|| {
+                    HomarrError::BadRequest(
+                        "DB_URL or DB_HOST is required for PostgreSQL".to_string(),
+                    )
+                })?;
+                let port = non_empty_env("DB_PORT").unwrap_or_else(|| "5432".to_string());
+                let user = non_empty_env("DB_USER").unwrap_or_else(|| "homarr".to_string());
+                let pass = non_empty_env("DB_PASSWORD").unwrap_or_default();
+                let name = non_empty_env("DB_NAME").unwrap_or_else(|| "homarrdb".to_string());
+                format!("postgres://{user}:{pass}@{host}:{port}/{name}")
+            }
+        };
+
+        let secret_encryption_key = match non_empty_env("SECRET_ENCRYPTION_KEY") {
+            Some(key) => {
+                if key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+                    let candidate = generate_secure_random_token(32);
+                    return Err(HomarrError::BadRequest(format!(
+                        "SECRET_ENCRYPTION_KEY must be a 64-character hex string; candidate: \"{candidate}\""
+                    )));
+                }
+                key
+            }
+            None => {
+                let generated = generate_secure_random_token(32);
+                eprintln!(
+                    "Warning: SECRET_ENCRYPTION_KEY is not set; using ephemeral key for this process. Set SECRET_ENCRYPTION_KEY in production (candidate: {generated})."
+                );
+                generated
+            }
+        };
+
+        let auth_secret =
+            non_empty_env("AUTH_SECRET").unwrap_or_else(|| generate_secure_random_token(32));
+
+        let host = non_empty_env("HOST").unwrap_or_else(|| "0.0.0.0".to_string());
+        let port = non_empty_env("PORT")
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(7575);
+
+        let redis_host = non_empty_env("REDIS_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+        let redis_port = non_empty_env("REDIS_PORT")
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(6379);
+        let redis_db = non_empty_env("REDIS_DATABASE_INDEX")
+            .and_then(|p| p.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let auth_providers = {
+            let parsed = parse_csv("AUTH_PROVIDERS");
+            if parsed.is_empty() {
+                vec!["credentials".to_string()]
+            } else {
+                parsed
+            }
+        };
+
+        let auth_session_expiry_secs = non_empty_env("AUTH_SESSION_EXPIRY_TIME")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(30 * 24 * 60 * 60);
+
+        let docker_socket_paths = {
+            let paths = parse_csv("DOCKER_SOCKET_PATHS");
+            if paths.is_empty() && parse_csv("DOCKER_HOSTNAMES").is_empty() {
+                vec!["/var/run/docker.sock".to_string()]
+            } else {
+                paths
+            }
+        };
+        let docker_hostnames = parse_csv("DOCKER_HOSTNAMES");
+        let docker_ports = parse_csv("DOCKER_PORTS")
+            .into_iter()
+            .filter_map(|p| p.parse::<u16>().ok())
+            .collect();
+
+        let website_url = non_empty_env("HOMARR_WEBSITE_URL")
+            .unwrap_or_else(|| "https://homarr.dev".to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let workshop_api_url = non_empty_env("WORKSHOP_API_URL")
+            .unwrap_or_else(|| website_url.clone())
+            .trim_end_matches('/')
+            .to_string();
+        let workshop_web_url = non_empty_env("WORKSHOP_WEB_URL")
+            .unwrap_or_else(|| format!("{website_url}/workshop"))
+            .trim_end_matches('/')
+            .to_string();
+
+        let local_certificate_path = non_empty_env("LOCAL_CERTIFICATE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/appdata/trusted-certificates"));
+
+        let assets_dir = non_empty_env("ASSETS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("assets"));
+
+        let static_data_dir = non_empty_env("STATIC_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("static-data"));
+
+        Ok(Self {
+            host,
+            port,
+            base_url: non_empty_env("BASE_URL").map(|u| u.trim_end_matches('/').to_string()),
+            db_driver,
+            db_url,
+            secret_encryption_key,
+            auth_secret,
+            auth_cookie_prefix: non_empty_env("AUTH_COOKIE_PREFIX")
+                .unwrap_or_else(|| "homarr".to_string()),
+            auth_providers,
+            auth_session_expiry_secs,
+            auth_trusted_proxy_header: non_empty_env("AUTH_TRUSTED_PROXY_HEADER"),
+            redis_is_external: parse_bool("REDIS_IS_EXTERNAL", false),
+            redis_host,
+            redis_port,
+            redis_username: non_empty_env("REDIS_USERNAME"),
+            redis_password: non_empty_env("REDIS_PASSWORD"),
+            redis_db,
+            redis_disabled: parse_bool("REDIS_DISABLED", false),
+            log_level: non_empty_env("LOG_LEVEL").unwrap_or_else(|| "info".to_string()),
+            local_certificate_path,
+            docker_socket_paths,
+            docker_hostnames,
+            docker_ports,
+            enable_kubernetes: parse_bool("ENABLE_KUBERNETES", false),
+            demo_mode: parse_bool("DEMO_MODE", false),
+            demo_read_only: parse_bool("DEMO_READ_ONLY", true),
+            unsafe_enable_mock_integration: parse_bool("UNSAFE_ENABLE_MOCK_INTEGRATION", false),
+            no_external_connection: parse_bool("NO_EXTERNAL_CONNECTION", false),
+            workshop_api_url,
+            workshop_web_url,
+            assets_dir,
+            static_data_dir,
+            homarr_request_identity_secret: non_empty_env("HOMARR_REQUEST_IDENTITY_SECRET"),
+        })
+    }
+
+    /// Returns a safe test/default configuration (in-memory SQLite, zero encryption key, Redis disabled).
+    pub fn for_test() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            base_url: None,
+            db_driver: DatabaseDriver::Sqlite,
+            db_url: "sqlite::memory:".to_string(),
+            secret_encryption_key: "0".repeat(64),
+            auth_secret: "1".repeat(64),
+            auth_cookie_prefix: "homarr".to_string(),
+            auth_providers: vec!["credentials".to_string()],
+            auth_session_expiry_secs: 86_400,
+            auth_trusted_proxy_header: None,
+            redis_is_external: false,
+            redis_host: "127.0.0.1".to_string(),
+            redis_port: 6379,
+            redis_username: None,
+            redis_password: None,
+            redis_db: 0,
+            redis_disabled: true,
+            log_level: "info".to_string(),
+            local_certificate_path: PathBuf::from("./test-certs"),
+            docker_socket_paths: Vec::new(),
+            docker_hostnames: Vec::new(),
+            docker_ports: Vec::new(),
+            enable_kubernetes: false,
+            demo_mode: false,
+            demo_read_only: true,
+            unsafe_enable_mock_integration: true,
+            no_external_connection: true,
+            workshop_api_url: "https://homarr.dev".to_string(),
+            workshop_web_url: "https://homarr.dev/workshop".to_string(),
+            assets_dir: PathBuf::from("assets"),
+            static_data_dir: PathBuf::from("static-data"),
+            homarr_request_identity_secret: None,
+        }
+    }
+
+    pub fn redis_url(&self) -> String {
+        let auth = match (&self.redis_username, &self.redis_password) {
+            (Some(u), Some(p)) => format!("{u}:{p}@"),
+            (None, Some(p)) => format!(":{p}@"),
+            (Some(u), None) => format!("{u}@"),
+            (None, None) => String::new(),
+        };
+        format!(
+            "redis://{auth}{}:{}/{}",
+            self.redis_host, self.redis_port, self.redis_db
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_for_test_builds_valid_redis_url() {
+        let cfg = AppConfig::for_test();
+        assert_eq!(cfg.redis_url(), "redis://127.0.0.1:6379/0");
+    }
+}

@@ -1,1 +1,0 @@
-ALTER TABLE `apiKey` ADD `read_only` integer DEFAULT false NOT NULL;

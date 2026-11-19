@@ -1,0 +1,17 @@
+[package]
+name = "homarr-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+bcrypt.workspace = true
+chrono.workspace = true
+homarr-common.workspace = true
+homarr-core.workspace = true
+homarr-db.workspace = true
+homarr-definitions.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true

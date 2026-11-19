@@ -1,0 +1,17 @@
+[package]
+name = "homarr-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+homarr-api.workspace = true
+homarr-common.workspace = true
+homarr-core.workspace = true
+homarr-db.workspace = true
+homarr-redis.workspace = true
+homarr-web.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true

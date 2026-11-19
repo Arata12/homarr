@@ -1,1 +1,0 @@
-ALTER TABLE `integration` ADD `external_url` text;

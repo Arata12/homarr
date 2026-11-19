@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/homarr-common",
+  "crates/homarr-definitions",
+  "crates/homarr-core",
+  "crates/homarr-db",
+  "crates/homarr-redis",
+  "crates/homarr-auth",
+  "crates/homarr-integrations",
+  "crates/homarr-services",
+  "crates/homarr-tasks",
+  "crates/homarr-widgets",
+  "crates/homarr-api",
+  "crates/homarr-web",
+  "crates/homarr-server",
+  "crates/homarr-cli",
+  "crates/homarr-workshop",
+]
+
+[workspace.package]
+version = "3.0.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
+tower = { version = "0.5", features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "trace", "compression-gzip", "limit", "set-header"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres", "chrono", "json"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies", "gzip", "deflate", "multipart", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+cuid2 = "0.1"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+hex = "0.4"
+base64 = "0.22"
+bcrypt = "0.17"
+rand = "0.8"
+subtle = "2"
+bollard = "0.18"
+cron = "0.15"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+thiserror = "2"
+futures-util = "0.3"
+bytes = "1"
+url = { version = "2", features = ["serde"] }
+regex = "1"
+quick-xml = "0.37"
+html-escape = "0.2"
+
+homarr-common = { path = "crates/homarr-common" }
+homarr-definitions = { path = "crates/homarr-definitions" }
+homarr-core = { path = "crates/homarr-core" }
+homarr-db = { path = "crates/homarr-db" }
+homarr-redis = { path = "crates/homarr-redis" }
+homarr-auth = { path = "crates/homarr-auth" }
+homarr-integrations = { path = "crates/homarr-integrations" }
+homarr-services = { path = "crates/homarr-services" }
+homarr-tasks = { path = "crates/homarr-tasks" }
+homarr-widgets = { path = "crates/homarr-widgets" }
+homarr-api = { path = "crates/homarr-api" }
+homarr-web = { path = "crates/homarr-web" }

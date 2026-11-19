@@ -1,1 +1,0 @@
-ALTER TABLE `custom_widget_v2_definition` ADD `workshop` text;

@@ -1,0 +1,23 @@
+[package]
+name = "homarr-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+homarr-api = { path = "../homarr-api" }
+homarr-auth.workspace = true
+homarr-common.workspace = true
+homarr-core.workspace = true
+homarr-db.workspace = true
+homarr-definitions.workspace = true
+homarr-widgets.workspace = true
+html-escape.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+homarr-redis.workspace = true
+tokio.workspace = true
+tower.workspace = true

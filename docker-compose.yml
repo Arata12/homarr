@@ -1,0 +1,116 @@
+services:
+  rust-dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    profiles: ["dev"]
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+      - cargo_target:/cargo-target
+    environment:
+      CARGO_TARGET_DIR: /cargo-target
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      POSTGRES_URL: postgres://homarr:homarr@postgres:5432/homarrdb
+      RUST_LOG: ${RUST_LOG:-info}
+      RUST_BACKTRACE: "1"
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:17-alpine
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: homarr
+      POSTGRES_PASSWORD: homarr
+      POSTGRES_DB: homarrdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U homarr -d homarrdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  homarr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    restart: unless-stopped
+    ports:
+      - "7575:7575"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - homarr_appdata:/appdata
+    environment:
+      PORT: "7575"
+      HOST: 0.0.0.0
+      DB_DRIVER: ${DB_DRIVER:-sqlite}
+      DB_URL: ${DB_URL:-/appdata/db/db.sqlite}
+      REDIS_IS_EXTERNAL: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      AUTH_SECRET: ${AUTH_SECRET:-fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210}
+      DEMO_MODE: ${DEMO_MODE:-false}
+      DEMO_READ_ONLY: ${DEMO_READ_ONLY:-true}
+      UNSAFE_ENABLE_MOCK_INTEGRATION: ${UNSAFE_ENABLE_MOCK_INTEGRATION:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ASSETS_DIR: /app/assets
+      WORKSHOP_API_URL: ${WORKSHOP_API_URL:-http://workshop:8090}
+      WORKSHOP_WEB_URL: ${WORKSHOP_WEB_URL:-http://localhost:8090}
+
+  workshop:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.workshop
+    profiles: ["workshop"]
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - workshop_data:/data
+    environment:
+      PORT: "8090"
+      HOST: 0.0.0.0
+      WORKSHOP_DB_URL: /data/workshop.sqlite
+      WORKSHOP_PUBLIC_DIR: /app/public
+
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: cli
+    profiles: ["cli"]
+    volumes:
+      - homarr_appdata:/appdata
+    environment:
+      DB_DRIVER: ${DB_DRIVER:-sqlite}
+      DB_URL: ${DB_URL:-/appdata/db/db.sqlite}
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+    entrypoint: ["/usr/local/bin/homarr"]
+
+volumes:
+  cargo_registry:
+  cargo_git:
+  cargo_target:
+  redis_data:
+  postgres_data:
+  homarr_appdata:
+  workshop_data:

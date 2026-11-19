@@ -1,1 +1,0 @@
-ALTER TABLE "apiKey" ADD COLUMN "read_only" boolean DEFAULT false NOT NULL;
