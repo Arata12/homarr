@@ -206,6 +206,8 @@ impl WidgetResolver {
                                     &self.db,
                                     &self.crypto,
                                     &self.integrations,
+                                    // API callers authorize options.integrationId before resolving.
+                                    None,
                                     &def.id,
                                     req_id,
                                     &opt_map,

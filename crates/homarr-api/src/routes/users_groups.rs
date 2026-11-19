@@ -38,9 +38,9 @@ pub async fn create_user(
 ) -> HomarrResult<(StatusCode, Json<Value>)> {
     admin.require_writable(state.demo_read_only_active())?;
     let name = body.name.trim().to_string();
-    if name.len() < 2 || body.password.len() < 4 {
+    if name.len() < 2 || body.password.chars().count() < 8 {
         return Err(HomarrError::BadRequest(
-            "Username must be >= 2 chars and password >= 4 chars".into(),
+            "Username must be >= 2 chars and password >= 8 chars".into(),
         ));
     }
     if users::find_by_name_ci(&state.db, &name).await?.is_some() {
@@ -98,6 +98,12 @@ pub async fn update_user(
     if !session.is_admin() && session.user_id != id {
         return Err(HomarrError::Forbidden("Forbidden".into()));
     }
+    let new_password = body.password.filter(|p| !p.is_empty());
+    if new_password.as_ref().is_some_and(|p| p.chars().count() < 8) {
+        return Err(HomarrError::BadRequest(
+            "Password must be >= 8 chars".into(),
+        ));
+    }
     users::update_profile(
         &state.db,
         &id,
@@ -106,7 +112,7 @@ pub async fn update_user(
         body.image.as_deref(),
     )
     .await?;
-    if let Some(pw) = body.password.filter(|p| !p.is_empty()) {
+    if let Some(pw) = new_password {
         let hash = hash_password(&pw).await?;
         users::update_password(&state.db, &id, &hash).await?;
     }

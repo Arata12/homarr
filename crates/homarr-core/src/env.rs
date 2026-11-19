@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub auth_providers: Vec<String>,
     pub auth_session_expiry_secs: i64,
     pub auth_trusted_proxy_header: Option<String>,
+    /// IPs/CIDRs allowed to set `auth_trusted_proxy_header`; empty means the header is ignored.
+    pub auth_trusted_proxy_ips: Vec<String>,
     pub redis_is_external: bool,
     pub redis_host: String,
     pub redis_port: u16,
@@ -328,6 +330,15 @@ impl AppConfig {
             auth_providers,
             auth_session_expiry_secs,
             auth_trusted_proxy_header: non_empty_env("AUTH_TRUSTED_PROXY_HEADER"),
+            auth_trusted_proxy_ips: non_empty_env("AUTH_TRUSTED_PROXY_IPS")
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             redis_is_external: parse_bool("REDIS_IS_EXTERNAL", false),
             redis_host,
             redis_port,
@@ -368,6 +379,7 @@ impl AppConfig {
             auth_providers: vec!["credentials".to_string()],
             auth_session_expiry_secs: 86_400,
             auth_trusted_proxy_header: None,
+            auth_trusted_proxy_ips: Vec::new(),
             redis_is_external: false,
             redis_host: "127.0.0.1".to_string(),
             redis_port: 6379,
