@@ -456,6 +456,16 @@ pub fn editor_blob(
                     json!([c.x, c.y, c.w, c.h, u8::from(c.real)]),
                 );
             }
+            // Stored placements outside the rendered section (e.g. a different section on
+            // mobile): the editor saves them back unchanged so they are not lost.
+            let mut other = Map::new();
+            for l in item
+                .layouts
+                .iter()
+                .filter(|l| l.section_id != pl.section_id)
+            {
+                other.insert(l.layout_id.clone(), json!(l));
+            }
             Some(json!({
                 "id": item.id,
                 "kind": item.kind,
@@ -464,6 +474,7 @@ pub fn editor_blob(
                 "integrationIds": item.integration_ids,
                 "sectionId": pl.section_id,
                 "p": p,
+                "o": other,
             }))
         })
         .collect();

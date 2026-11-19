@@ -1022,4 +1022,198 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn list_apps_rejects_anonymous_and_regular_users() {
+        let (_state, app) = setup_test_state().await;
+        let (status, _) = send_json(&app, "GET", "/api/apps", None, json!({})).await;
+        assert!(matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+
+        let admin = login_cookie(&app, "demo", "demo").await;
+        create_regular_user(&app, &admin, "appviewer", "appviewer1").await;
+        let viewer = login_cookie(&app, "appviewer", "appviewer1").await;
+        let (status, _) = send_json(&app, "GET", "/api/apps", Some(&viewer), json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = send_json(&app, "GET", "/api/apps", Some(&admin), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_app_hides_apps_not_on_viewable_boards() {
+        let (_state, app) = setup_test_state().await;
+        let admin = login_cookie(&app, "demo", "demo").await;
+        let (status, created) = send_json(
+            &app,
+            "POST",
+            "/api/apps",
+            Some(&admin),
+            json!({ "name": "Hidden", "iconUrl": "/logo.png", "href": "http://10.0.0.5" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let uri = format!("/api/apps/{}", created["id"].as_str().unwrap());
+
+        let (status, _) = send_json(&app, "GET", &uri, None, json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        create_regular_user(&app, &admin, "appviewer2", "appviewer2").await;
+        let viewer = login_cookie(&app, "appviewer2", "appviewer2").await;
+        let (status, _) = send_json(&app, "GET", &uri, Some(&viewer), json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send_json(&app, "GET", &uri, Some(&admin), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn renaming_user_onto_existing_name_conflicts() {
+        let (_state, app) = setup_test_state().await;
+        let admin = login_cookie(&app, "demo", "demo").await;
+        create_regular_user(&app, &admin, "alice", "password123").await;
+        let bob = create_regular_user(&app, &admin, "bob", "password123").await;
+        let uri = format!("/api/users/{bob}");
+        let (status, body) = send_json(
+            &app,
+            "PATCH",
+            &uri,
+            Some(&admin),
+            json!({ "name": "ALICE" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let (status, body) =
+            send_json(&app, "PATCH", &uri, Some(&admin), json!({ "name": "Bob" })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn everyone_group_is_protected() {
+        let (state, app) = setup_test_state().await;
+        let admin = login_cookie(&app, "demo", "demo").await;
+        let everyone = repos::groups::get_by_name(&state.db, "everyone")
+            .await
+            .unwrap()
+            .expect("everyone group seeded");
+        let uri = format!("/api/groups/{}", everyone.id);
+
+        let (status, _) = send_json(&app, "DELETE", &uri, Some(&admin), json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = send_json(
+            &app,
+            "PATCH",
+            &uri,
+            Some(&admin),
+            json!({ "name": "renamed" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/api/groups",
+            Some(&admin),
+            json!({ "name": "Everyone" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn anonymous_external_fetches_and_media_list_are_rejected() {
+        let (_state, app) = setup_test_state().await;
+        let (status, _) = send_json(
+            &app,
+            "GET",
+            "/api/external/rss?url=http%3A%2F%2F127.0.0.1%3A1%2Ffeed.xml",
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = send_json(
+            &app,
+            "GET",
+            "/api/icons/favicon?url=http%3A%2F%2F127.0.0.1%3A1%2F",
+            None,
+            json!({}),
+        )
+        .await;
+        assert!(matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+        let (status, _) = send_json(&app, "GET", "/api/medias", None, json!({})).await;
+        assert!(matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/api/widgets/resolve",
+            None,
+            json!({ "kind": "rssFeed", "options": { "feedUrls": ["http://127.0.0.1:1/x"] } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn assistant_config_rejects_unsafe_urls_and_drops_key_on_new_destination() {
+        let (_state, app) = setup_test_state().await;
+        let admin = login_cookie(&app, "demo", "demo").await;
+        let put = |body: Value| {
+            let admin = admin.clone();
+            let app = app.clone();
+            async move { send_json(&app, "PUT", "/api/assistant/config", Some(&admin), body).await }
+        };
+
+        for bad in [
+            "https://user:pass@example.com/v1",
+            "https://example.com/v1?key=1",
+            "https://example.com/v1#frag",
+            "ftp://example.com/v1",
+        ] {
+            let (status, _) =
+                put(json!({ "enabled": false, "provider": "openai", "baseUrl": bad })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} should be rejected");
+        }
+
+        let (status, body) = put(json!({
+            "enabled": false,
+            "provider": "openai",
+            "baseUrl": "https://a.example.com/v1",
+            "apiKey": "sk-test"
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        put(json!({ "enabled": false, "provider": "openai", "baseUrl": "https://a.example.com/v1/" }))
+            .await;
+        let (_, cfg) = send_json(
+            &app,
+            "GET",
+            "/api/assistant/config",
+            Some(&admin),
+            json!({}),
+        )
+        .await;
+        assert_eq!(cfg["hasApiKey"], json!(true));
+
+        let (status, _) =
+            put(json!({ "enabled": false, "provider": "openai", "baseUrl": "https://b.example.com/v1" }))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, cfg) = send_json(
+            &app,
+            "GET",
+            "/api/assistant/config",
+            Some(&admin),
+            json!({}),
+        )
+        .await;
+        assert_eq!(cfg["hasApiKey"], json!(false));
+    }
 }

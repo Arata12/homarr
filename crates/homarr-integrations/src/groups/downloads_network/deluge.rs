@@ -14,6 +14,7 @@ use crate::capabilities::downloads::{
     DownloadClientJobsAndStatus, DownloadClientRates, DownloadClientSelection,
     DownloadClientStatus, DownloadClientType,
 };
+use crate::http_auth::ResolvedHttpAuth;
 use crate::runtime::IntegrationRuntime;
 use crate::types::IntegrationContext;
 
@@ -231,6 +232,23 @@ impl Deluge {
             .cloned()
             .collect())
     }
+}
+
+/// Credentials for custom widget HTTP requests (port of `getHttpAuthenticationAsync`): a fresh login cookie,
+/// which also replaces the stored session.
+pub(crate) async fn http_auth(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+) -> HomarrResult<ResolvedHttpAuth> {
+    let cookie = Deluge::login(rt, ctx).await?;
+    rt.sessions.set(ctx, &cookie, None);
+    let mut redact_values = vec![ctx.require_secret("password")?.to_string()];
+    redact_values.extend(cookie.split("; ").map(str::to_string));
+    Ok(ResolvedHttpAuth {
+        headers: [("Cookie".to_string(), cookie)].into(),
+        redact_values,
+        ..Default::default()
+    })
 }
 
 #[async_trait]

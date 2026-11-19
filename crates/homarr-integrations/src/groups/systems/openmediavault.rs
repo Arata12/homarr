@@ -13,6 +13,7 @@ use crate::capabilities::health_monitoring::{
     FileSystemInfo, LoadAverage, SmartInfo, SystemHealthMonitoring,
 };
 use crate::error::{parse_error, request_error, status_error};
+use crate::http_auth::ResolvedHttpAuth;
 use crate::runtime::IntegrationRuntime;
 use crate::types::IntegrationContext;
 
@@ -241,6 +242,40 @@ pub async fn test_connection(
     ctx: &IntegrationContext,
 ) -> HomarrResult<()> {
     new_session(rt, ctx).await.map(|_| ())
+}
+
+/// Credentials for custom widget HTTP requests (port of `getHttpAuthenticationAsync`): a fresh session.
+pub async fn http_auth(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+) -> HomarrResult<ResolvedHttpAuth> {
+    Ok(session_http_auth(&new_session(rt, ctx).await?))
+}
+
+fn session_http_auth(session: &Session) -> ResolvedHttpAuth {
+    let (header, value, redact_values) = match session {
+        Session::Header { session_id } => (
+            "X-OPENMEDIAVAULT-SESSIONID",
+            session_id.clone(),
+            vec![session_id.clone()],
+        ),
+        Session::Cookie {
+            login_token,
+            session_id,
+        } => {
+            let cookie = format!("{login_token};{session_id}");
+            (
+                "Cookie",
+                cookie.clone(),
+                vec![cookie, login_token.clone(), session_id.clone()],
+            )
+        }
+    };
+    ResolvedHttpAuth {
+        headers: [(header.to_string(), value)].into(),
+        redact_values,
+        ..Default::default()
+    }
 }
 
 /// Authenticated RPC call; a `401` with the stored session logs in again.
@@ -512,6 +547,21 @@ mod tests {
         assert!(generate_totp_code("123456", 0).is_err());
         assert!(generate_totp_code("not base32 !!!!!!!!", 0).is_err());
         assert!(generate_totp_code("GEZD-GNBV GY3T-QOJQ GEZD-GNBV GY3T-QOJQ", 0).is_ok());
+    }
+
+    #[test]
+    fn builds_http_auth_for_header_and_cookie_sessions() {
+        let header = session_http_auth(&Session::Header {
+            session_id: "sid".into(),
+        });
+        assert_eq!(header.headers["X-OPENMEDIAVAULT-SESSIONID"], "sid");
+        assert_eq!(header.redact_values, ["sid"]);
+        let cookie = session_http_auth(&Session::Cookie {
+            login_token: "a=1".into(),
+            session_id: "b=2".into(),
+        });
+        assert_eq!(cookie.headers["Cookie"], "a=1;b=2");
+        assert_eq!(cookie.redact_values, ["a=1;b=2", "a=1", "b=2"]);
     }
 
     #[test]

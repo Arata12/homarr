@@ -27,6 +27,7 @@ use self::types::*;
 use super::util::{basic_auth, input_str, input_u64, to_json, unknown_operation};
 use crate::capabilities::notifications::Notification;
 use crate::error::{classify_request_error, RequestFailure};
+use crate::http_auth::ResolvedHttpAuth;
 use crate::runtime::IntegrationRuntime;
 use crate::types::IntegrationContext;
 
@@ -250,6 +251,31 @@ async fn api_token(
         Some(TOKEN_TTL),
     );
     Ok(token)
+}
+
+/// Credentials for custom widget HTTP requests (port of `getHttpAuthenticationAsync`): a bearer token for the
+/// Wazuh API, otherwise basic auth for the indexer.
+pub async fn http_auth(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+) -> HomarrResult<ResolvedHttpAuth> {
+    let Endpoints { api, indexer } = endpoints(ctx);
+    let (header, redact_values) = if let Some(api) = api {
+        let token = api_token(rt, ctx, &api).await?;
+        (format!("Bearer {token}"), vec![token])
+    } else if let Some(indexer) = indexer {
+        let header = basic_auth(&indexer.username, &indexer.password);
+        (header.clone(), vec![header, indexer.password])
+    } else {
+        return Err(HomarrError::BadRequest(
+            "Wazuh integration has no usable credentials".to_string(),
+        ));
+    };
+    Ok(ResolvedHttpAuth {
+        headers: [("Authorization".to_string(), header)].into(),
+        redact_values,
+        ..Default::default()
+    })
 }
 
 async fn api_get<T: DeserializeOwned>(

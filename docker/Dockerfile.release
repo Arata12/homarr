@@ -11,10 +11,22 @@
 #
 # distroless/static: no shell or package manager. It ships /etc/passwd,
 # /tmp, CA certificates and tzdata, adding only about 2 MB to the image.
-FROM gcr.io/distroless/static-debian13:latest
+#
+# Runs as the distroless `nonroot` user (65532:65532). PUID/PGID are NOT
+# supported here (no shell to drop privileges); use `user: "<uid>:<gid>"` in
+# compose instead and make the /appdata volume writable by that uid. Reaching
+# /var/run/docker.sock needs `group_add: ["<docker socket gid>"]`.
+
+# The debug variant only provides a busybox shell to prepare /appdata.
+FROM --platform=$BUILDPLATFORM gcr.io/distroless/static-debian13:debug AS appdata
+RUN ["/busybox/sh", "-c", "mkdir -p /out/appdata/db /out/appdata/secrets /out/appdata/trusted-certificates"]
+
+FROM gcr.io/distroless/static-debian13:nonroot
 
 COPY --chmod=0755 bin/homarr-server bin/homarr bin/homarr-workshop /usr/local/bin/
 COPY assets /app/assets
+# Copy the contents of /out so `appdata` itself is a copied entry and gets --chown.
+COPY --from=appdata --chown=65532:65532 /out/ /
 
 WORKDIR /app
 

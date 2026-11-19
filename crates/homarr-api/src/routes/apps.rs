@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -6,7 +8,7 @@ use axum::{
 use homarr_auth::{can_view_board, AuthSession, OptionalAuth, RequireAuth};
 use homarr_common::{HomarrError, HomarrResult};
 use homarr_db::{
-    models::AppRecord,
+    models::{AppRecord, BoardRecord},
     repos::{
         apps::{self, AppInput},
         boards, settings,
@@ -18,9 +20,56 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-pub async fn list_apps(State(state): State<AppState>) -> HomarrResult<Json<Value>> {
+/// Listing every app (with internal URLs) requires app-modify-all, as in the original.
+pub async fn list_apps(
+    RequireAuth(session): RequireAuth,
+    State(state): State<AppState>,
+) -> HomarrResult<Json<Value>> {
+    session.require_permission(GroupPermissionKey::AppModifyAll)?;
     let items = apps::list_all(&state.db).await?;
     Ok(Json(json!({ "items": items })))
+}
+
+/// Apps the caller may see: all with app-modify-all, otherwise only apps placed
+/// on a board the caller can view.
+pub async fn visible_apps(
+    state: &AppState,
+    session: Option<&AuthSession>,
+) -> HomarrResult<Vec<AppRecord>> {
+    let all = apps::list_all(&state.db).await?;
+    if session.is_some_and(|s| s.has_permission(GroupPermissionKey::AppModifyAll)) {
+        return Ok(all);
+    }
+    let mut viewable = Vec::new();
+    for board in boards::list_all(&state.db).await? {
+        if can_view_board(&state.db, session, &board).await? {
+            viewable.push(board);
+        }
+    }
+    let ids = app_ids_on_boards(state, &viewable).await?;
+    Ok(all.into_iter().filter(|a| ids.contains(&a.id)).collect())
+}
+
+/// Ids of the apps placed (as app items) on any of the given boards.
+pub async fn app_ids_on_boards(
+    state: &AppState,
+    board_list: &[BoardRecord],
+) -> HomarrResult<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for board in board_list {
+        let Some(full) = boards::get_full_board_by_id(&state.db, &board.id).await? else {
+            continue;
+        };
+        for item in &full.items {
+            if item.kind != "app" {
+                continue;
+            }
+            if let Some(app_id) = item.options.get("appId").and_then(|v| v.as_str()) {
+                ids.insert(app_id.to_string());
+            }
+        }
+    }
+    Ok(ids)
 }
 
 #[derive(Deserialize)]
@@ -55,13 +104,24 @@ pub async fn create_app(
     Ok((StatusCode::CREATED, Json(app)))
 }
 
+/// Allowed with app-modify-all, or when the app is on a board the caller can view
+/// (anonymous callers: public boards only).
 pub async fn get_app(
+    OptionalAuth(session): OptionalAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> HomarrResult<Json<AppRecord>> {
+    // Same 404 for "missing" and "not visible" to avoid app-id enumeration.
+    let not_found = || HomarrError::NotFound("App not found".into());
     let app = apps::get_by_id(&state.db, &id)
         .await?
-        .ok_or_else(|| HomarrError::NotFound("App not found".into()))?;
+        .ok_or_else(not_found)?;
+    let can_modify = session
+        .as_ref()
+        .is_some_and(|s| s.has_permission(GroupPermissionKey::AppModifyAll));
+    if !can_modify && !app_on_viewable_board(&state, session.as_ref(), &app.id).await? {
+        return Err(not_found());
+    }
     Ok(Json(app))
 }
 

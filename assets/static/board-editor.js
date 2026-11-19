@@ -100,6 +100,33 @@
     return p;
   }
 
+  // it.o[layoutId] holds a stored placement in a section other than the rendered one. The editor
+  // can't show it, so it is saved back untouched unless the user moves this item in that layout.
+  function claim(it) {
+    if (it.o) delete it.o[curLayoutId];
+  }
+
+  /** Moves an item to another section in the edited layout only; other layouts keep theirs. */
+  function changeSection(it, sectionId) {
+    it.o = it.o || {};
+    for (const l of layouts) {
+      const p = it.p[l.id];
+      if (l.id === curLayoutId || it.o[l.id] || !p || !p[4]) continue;
+      it.o[l.id] = {
+        itemId: it.id,
+        sectionId: it.sectionId,
+        layoutId: l.id,
+        xOffset: p[0],
+        yOffset: p[1],
+        width: p[2],
+        height: p[3],
+      };
+      p[4] = 0;
+    }
+    claim(it);
+    it.sectionId = sectionId;
+  }
+
   function itemsIn(sectionId, excludeId) {
     const out = [];
     for (const it of items.values()) {
@@ -219,11 +246,12 @@
         options: it.options || {},
         advancedOptions: it.advancedOptions || {},
         integrationIds: it.integrationIds || [],
-        layouts: layouts
-          .filter((l) => it.p[l.id] && it.p[l.id][4])
-          .map((l) => {
-            const p = it.p[l.id];
-            return {
+        layouts: layouts.flatMap((l) => {
+          if (it.o && it.o[l.id]) return [it.o[l.id]];
+          const p = it.p[l.id];
+          if (!p || !p[4]) return [];
+          return [
+            {
               itemId: it.id,
               sectionId: it.sectionId,
               layoutId: l.id,
@@ -231,8 +259,9 @@
               yOffset: p[1],
               width: p[2],
               height: p[3],
-            };
-          }),
+            },
+          ];
+        }),
       })),
     };
   }
@@ -861,10 +890,10 @@
         } else {
           const p = placement(it);
           if (sectionId !== it.sectionId) {
-            it.sectionId = sectionId;
-            for (const l of layouts) if (l.id !== curLayoutId && it.p[l.id]) it.p[l.id][4] = 0;
+            changeSection(it, sectionId);
             it.p[curLayoutId] = firstFree(sectionId, w, hh).concat(1);
           } else if (w !== p[2] || hh !== p[3]) {
+            claim(it);
             const res = settle(sectionId, { id: it.id, x: clamp(p[0], 0, curCols() - w), y: p[1], w, h: hh });
             for (const [id, r] of res) items.get(id).p[curLayoutId] = r.concat(1);
           }
@@ -1039,7 +1068,13 @@
   async function removeSection(id) {
     if (sections.length <= 1) return toast(T("lastSection"), "error");
     if (!confirm(T("confirmRemoveSection"))) return;
-    for (const it of [...items.values()]) if (it.sectionId === id) items.delete(it.id);
+    for (const it of [...items.values()]) {
+      for (const k of Object.keys(it.o || {})) if (it.o[k].sectionId === id) delete it.o[k];
+      if (it.sectionId !== id) continue;
+      // Keep the item while another layout still places it in a different section.
+      if (!Object.keys(it.o || {}).length) items.delete(it.id);
+      else for (const l of layouts) if (it.p[l.id]) it.p[l.id][4] = 0;
+    }
     sections.splice(
       sections.findIndex((s) => s.id === id),
       1
@@ -1158,6 +1193,7 @@
     const copy = clone(src);
     copy.id = newId();
     copy.p = {};
+    delete copy.o;
     copy.p[curLayoutId] = firstFree(src.sectionId, p[2], p[3]).concat(1);
     const baseLayout = layouts.find((l) => l.role === "base") || layouts[0];
     if (baseLayout && baseLayout.id !== curLayoutId) {
@@ -1318,10 +1354,8 @@
       if (!cancel && g.result) {
         const moved = g.target !== g.it.sectionId;
         const sourceId = g.it.sectionId;
-        if (moved) {
-          g.it.sectionId = g.target;
-          for (const l of layouts) if (l.id !== curLayoutId && g.it.p[l.id]) g.it.p[l.id][4] = 0;
-        }
+        if (moved) changeSection(g.it, g.target);
+        claim(g.it);
         commitResult(g.result);
         if (moved) commitResult(settle(sourceId, null, null));
         scheduleSave();
@@ -1334,6 +1368,7 @@
     } else {
       g.el.classList.remove("is-resizing");
       if (!cancel && g.result) {
+        claim(g.it);
         commitResult(g.result);
         scheduleSave();
       }

@@ -84,8 +84,8 @@ pub async fn save_config(db: &Database, cfg: &AssistantConfigRecord) -> HomarrRe
                    "enabled" = excluded."enabled", "web_search_enabled" = excluded."web_search_enabled",
                    "provider" = excluded."provider", "base_url" = excluded."base_url",
                    "model_discovery_path" = excluded."model_discovery_path",
-                   "encrypted_api_key" = coalesce(excluded."encrypted_api_key", "assistant_configuration"."encrypted_api_key"),
-                   "encrypted_headers" = coalesce(excluded."encrypted_headers", "assistant_configuration"."encrypted_headers"),
+                   "encrypted_api_key" = excluded."encrypted_api_key",
+                   "encrypted_headers" = excluded."encrypted_headers",
                    "model_id" = excluded."model_id", "updated_at" = excluded."updated_at""#,
             )
             .bind(cfg.enabled)
@@ -110,8 +110,8 @@ pub async fn save_config(db: &Database, cfg: &AssistantConfigRecord) -> HomarrRe
                    "enabled" = excluded."enabled", "web_search_enabled" = excluded."web_search_enabled",
                    "provider" = excluded."provider", "base_url" = excluded."base_url",
                    "model_discovery_path" = excluded."model_discovery_path",
-                   "encrypted_api_key" = coalesce(excluded."encrypted_api_key", "assistant_configuration"."encrypted_api_key"),
-                   "encrypted_headers" = coalesce(excluded."encrypted_headers", "assistant_configuration"."encrypted_headers"),
+                   "encrypted_api_key" = excluded."encrypted_api_key",
+                   "encrypted_headers" = excluded."encrypted_headers",
                    "model_id" = excluded."model_id", "updated_at" = excluded."updated_at""#,
             )
             .bind(cfg.enabled)

@@ -41,6 +41,10 @@ mod traefik;
 mod transmission;
 mod unifi;
 
+pub(crate) use self::deluge::http_auth as deluge_http_auth;
+pub(crate) use self::pihole::http_auth as pihole_http_auth;
+pub(crate) use self::unifi::http_auth as unifi_http_auth;
+
 pub struct DownloadsNetworkGroup;
 
 const KINDS: &[IntegrationKind] = &[

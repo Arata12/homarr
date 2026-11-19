@@ -163,16 +163,84 @@ pub struct FaviconQuery {
 }
 
 pub async fn fetch_favicon(
+    RequireAuth(session): RequireAuth,
     State(state): State<AppState>,
     Query(params): Query<FaviconQuery>,
 ) -> HomarrResult<Json<Value>> {
+    // Original `detectMetadata` requires app-create (admins hold every permission).
+    session.require_permission(GroupPermissionKey::AppCreate)?;
     let icon_url = state.services.icons.fetch_favicon_url(&params.url).await?;
     Ok(Json(json!({ "iconUrl": icon_url })))
 }
 
-pub async fn list_medias(State(state): State<AppState>) -> HomarrResult<Json<Value>> {
-    let items = medias::list_metadata(&state.db).await?;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaListQuery {
+    #[serde(default)]
+    pub include_from_all_users: bool,
+}
+
+pub async fn list_medias(
+    RequireAuth(session): RequireAuth,
+    State(state): State<AppState>,
+    Query(params): Query<MediaListQuery>,
+) -> HomarrResult<Json<Value>> {
+    let mut items = medias::list_metadata(&state.db).await?;
+    let all_users =
+        params.include_from_all_users && session.has_permission(GroupPermissionKey::MediaViewAll);
+    if !all_users {
+        items.retain(|m| m.creator_id.as_deref() == Some(session.user_id.as_str()));
+    }
     Ok(Json(json!({ "items": items })))
+}
+
+/// Allowed upload types and limit, matching the original `@homarr/validation/media`.
+const MEDIA_UPLOAD_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/svg+xml",
+    "video/mp4",
+    "video/webm",
+];
+const MEDIA_UPLOAD_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Port of the original `matchesMediaContentType`: the declared type must match the leading bytes.
+fn matches_media_content_type(data: &[u8], content_type: &str) -> bool {
+    let h = &data[..data.len().min(4096)];
+    match content_type {
+        "image/png" => h.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        "image/jpeg" => h.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/gif" => h.starts_with(b"GIF87a") || h.starts_with(b"GIF89a"),
+        "image/webp" => h.starts_with(b"RIFF") && h.get(8..12) == Some(b"WEBP".as_slice()),
+        // SVG has no magic bytes; get_media serves everything sandboxed with nosniff instead.
+        "image/svg+xml" => true,
+        "video/mp4" => {
+            if h.len() < 16 || h.get(4..8) != Some(b"ftyp".as_slice()) {
+                return false;
+            }
+            let box_size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+            if box_size < 16 || box_size > h.len() {
+                return false;
+            }
+            (8..box_size - 3).step_by(4).filter(|&o| o != 12).any(|o| {
+                let brand = &h[o..o + 4];
+                matches!(brand, [b'i', b's', b'o', b'2'..=b'9'])
+                    || [
+                        b"isom", b"mp41", b"mp42", b"avc1", b"dash", b"M4V ", b"MSNV",
+                    ]
+                    .iter()
+                    .any(|b| brand == b.as_slice())
+            })
+        }
+        "video/webm" => {
+            h.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
+                && h.windows(7)
+                    .any(|w| w == [0x42, 0x82, 0x84, b'w', b'e', b'b', b'm'])
+        }
+        _ => false,
+    }
 }
 
 pub async fn upload_media(
@@ -196,10 +264,7 @@ pub async fn upload_media(
             .content_type()
             .map(str::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        if !matches!(
-            content_type.as_str(),
-            "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/x-icon"
-        ) {
+        if !MEDIA_UPLOAD_TYPES.contains(&content_type.as_str()) {
             return Err(HomarrError::BadRequest(format!(
                 "Unsupported media content-type '{content_type}'"
             )));
@@ -208,10 +273,15 @@ pub async fn upload_media(
             .bytes()
             .await
             .map_err(|e| HomarrError::BadRequest(format!("Read upload failed: {e}")))?;
-        if bytes.len() > 32 * 1024 * 1024 {
+        if bytes.len() > MEDIA_UPLOAD_MAX_BYTES {
             return Err(HomarrError::BadRequest(
-                "Media upload exceeds 32MB limit".into(),
+                "Media upload exceeds 32 MiB limit".into(),
             ));
+        }
+        if !matches_media_content_type(&bytes, &content_type) {
+            return Err(HomarrError::BadRequest(format!(
+                "File content does not match content-type '{content_type}'"
+            )));
         }
         let summary = medias::create(
             &state.db,
@@ -236,10 +306,20 @@ pub async fn get_media(
         .ok_or_else(|| HomarrError::NotFound("Media not found".into()))?;
     let mut resp = Response::new(Body::from(media.content));
     *resp.status_mut() = StatusCode::OK;
+    let headers = resp.headers_mut();
     if let Ok(ct) = HeaderValue::from_str(&media.content_type) {
-        resp.headers_mut().insert(header::CONTENT_TYPE, ct);
+        headers.insert(header::CONTENT_TYPE, ct);
     }
-    resp.headers_mut().insert(
+    // Uploads may be SVG: same sandbox as the image proxy so they never run script on our origin.
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'; style-src 'unsafe-inline'"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
@@ -252,7 +332,13 @@ pub async fn delete_media(
     Path(id): Path<String>,
 ) -> HomarrResult<Json<Value>> {
     session.require_writable(state.demo_read_only_active())?;
-    session.require_permission(GroupPermissionKey::MediaFullAll)?;
+    let media = medias::get_by_id(&state.db, &id)
+        .await?
+        .ok_or_else(|| HomarrError::NotFound("Media not found".into()))?;
+    // Original: the creator or a media-full-all holder may delete.
+    if media.creator_id.as_deref() != Some(session.user_id.as_str()) {
+        session.require_permission(GroupPermissionKey::MediaFullAll)?;
+    }
     let deleted = medias::delete(&state.db, &id).await?;
     if !deleted {
         return Err(HomarrError::NotFound("Media not found".into()));

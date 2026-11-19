@@ -273,11 +273,25 @@ fn resolve_adapter_http_auth(ctx: &IntegrationContext) -> HomarrResult<ResolvedH
             headers.insert("Authorization".to_string(), format!("Basic {enc}"));
             redact_values.push(enc);
         }
-        IntegrationKind::PiHole => {
-            if let Some(key) = ctx.secret("apiKey") {
-                headers.insert("X-FTL-SID".to_string(), key.to_string());
-                redact_values.push(key.to_string());
-            }
+        // Subsonic credentials as query parameters (navidrome `getAuthParams`).
+        IntegrationKind::Navidrome => {
+            let user = ctx.require_secret("username")?;
+            let pass = ctx.require_secret("password")?;
+            let query = [
+                ("u", user),
+                ("p", pass),
+                ("v", "1.16.1"),
+                ("c", "homarr"),
+                ("f", "json"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+            return Ok(ResolvedHttpAuth {
+                query,
+                redact_values: vec![pass.to_string()],
+                ..Default::default()
+            });
         }
         IntegrationKind::TechnitiumDns => {
             if let Some(key) = ctx.secret("apiKey") {
@@ -317,7 +331,7 @@ const REDACTED: &str = "[REDACTED]";
 /// Shorter credentials can be ordinary words in response data, so they are only redacted on exact match.
 const MIN_EMBEDDED_SECRET_LEN: usize = 12;
 /// Characters JavaScript's `encodeURIComponent` leaves unescaped.
-const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+pub(crate) const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
@@ -327,6 +341,25 @@ const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'\'')
     .remove(b'(')
     .remove(b')');
+
+/// Like [`resolve_declared_http_auth`], but logs in first for integrations whose custom-widget
+/// proxy auth needs a live session (port of the original `getHttpAuthenticationAsync`).
+pub async fn resolve_http_auth(
+    rt: &crate::runtime::IntegrationRuntime,
+    ctx: &IntegrationContext,
+) -> HomarrResult<ResolvedHttpAuth> {
+    use crate::groups::{downloads_network as dn, home_misc as hm, systems as sy};
+    match ctx.kind {
+        IntegrationKind::Deluge => dn::deluge_http_auth(rt, ctx).await,
+        IntegrationKind::PiHole => dn::pihole_http_auth(rt, ctx).await,
+        IntegrationKind::UnifiController => dn::unifi_http_auth(rt, ctx).await,
+        IntegrationKind::Openmediavault => sy::openmediavault_http_auth(rt, ctx).await,
+        IntegrationKind::Synology => sy::synology_http_auth(rt, ctx).await,
+        IntegrationKind::Beszel => sy::beszel_http_auth(rt, ctx).await,
+        IntegrationKind::Wazuh => hm::wazuh_http_auth(rt, ctx).await,
+        _ => resolve_declared_http_auth(ctx),
+    }
+}
 
 /// Removes integration secrets from upstream responses (port of `redactResponseSecrets`).
 #[derive(Debug, Default)]
@@ -483,6 +516,44 @@ mod tests {
                 .collect(),
         };
         SecretRedactor::new(&ctx, &auth)
+    }
+
+    fn ctx(kind: IntegrationKind, secrets: &[(&str, &str)]) -> IntegrationContext {
+        IntegrationContext {
+            id: "id".to_string(),
+            name: "name".to_string(),
+            url: "http://localhost".to_string(),
+            external_url: None,
+            kind,
+            secrets: secrets
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn navidrome_sends_subsonic_query_auth() {
+        let navidrome = ctx(
+            IntegrationKind::Navidrome,
+            &[("username", "user"), ("password", "pass")],
+        );
+        let auth = resolve_adapter_http_auth(&navidrome).unwrap();
+        assert!(auth.headers.is_empty());
+        assert_eq!(auth.query["u"], "user");
+        assert_eq!(auth.query["p"], "pass");
+        assert_eq!(auth.query["v"], "1.16.1");
+        assert_eq!(auth.query["c"], "homarr");
+        assert_eq!(auth.query["f"], "json");
+        assert_eq!(auth.redact_values, ["pass"]);
+    }
+
+    #[test]
+    fn pihole_api_key_is_not_sent_as_session_id() {
+        let pihole = ctx(IntegrationKind::PiHole, &[("apiKey", KEY)]);
+        let auth = resolve_adapter_http_auth(&pihole).unwrap();
+        assert!(auth.headers.is_empty());
+        assert!(auth.query.is_empty());
     }
 
     #[test]

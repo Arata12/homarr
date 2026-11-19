@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     extract::{Path, Query, State},
@@ -6,10 +6,14 @@ use axum::{
     response::Html,
     Json,
 };
-use homarr_auth::{check_integration_permission, OptionalAuth, RequireAdmin, RequireAuth};
+use homarr_auth::{
+    can_view_board, check_integration_permission, AuthSession, OptionalAuth, RequireAdmin,
+    RequireAuth,
+};
 use homarr_common::{HomarrError, HomarrResult};
+use homarr_db::repos::boards;
 use homarr_db::repos::custom_widgets::{self as cw_repo, CustomWidgetV2Input};
-use homarr_definitions::{IntegrationPermission, WidgetKind};
+use homarr_definitions::{GroupPermissionKey, IntegrationPermission, WidgetKind};
 use homarr_services::validate_custom_widget_definition;
 use homarr_widgets::{all_widget_metadata, get_widget_metadata, render_widget_html};
 use serde::Deserialize;
@@ -36,6 +40,16 @@ async fn authorize_widget_integrations(
     options: &Value,
     integration_ids: &[String],
 ) -> HomarrResult<()> {
+    // These widgets fetch caller-supplied targets; same rule as /api/external/{rss,minecraft}.
+    if matches!(
+        kind,
+        WidgetKind::RssFeed | WidgetKind::MinecraftServerStatus
+    ) && !can_query_any_external_target(session)
+    {
+        return Err(HomarrError::Forbidden(
+            "Not allowed to query arbitrary external targets".into(),
+        ));
+    }
     let opt_int = options
         .get("integrationId")
         .and_then(|v| v.as_str())
@@ -479,17 +493,69 @@ pub struct RssQuery {
     pub limit: Option<usize>,
 }
 
+/// Mirrors the original `canAccessAllFeedsAsync`: callers who can put any widget on a board may
+/// query any external target; everyone else only targets configured on a board they can view.
+fn can_query_any_external_target(session: Option<&AuthSession>) -> bool {
+    session.is_some_and(|s| {
+        s.is_admin()
+            || s.has_permission(GroupPermissionKey::BoardCreate)
+            || s.has_permission(GroupPermissionKey::BoardModifyAll)
+    })
+}
+
+/// Options of every `kind` widget item on the boards the caller can view.
+// shortcut: loads every viewable board; add an items-by-kind repo query if board counts grow large.
+async fn viewable_widget_options(
+    state: &AppState,
+    session: Option<&AuthSession>,
+    kind: WidgetKind,
+) -> HomarrResult<Vec<Value>> {
+    let mut options = Vec::new();
+    for board in boards::list_all(&state.db).await? {
+        if !can_view_board(&state.db, session, &board).await? {
+            continue;
+        }
+        if let Some(full) = boards::get_full_board_by_id(&state.db, &board.id).await? {
+            options.extend(
+                full.items
+                    .into_iter()
+                    .filter(|item| item.kind == kind.as_str())
+                    .map(|item| item.options),
+            );
+        }
+    }
+    Ok(options)
+}
+
 pub async fn external_rss(
+    OptionalAuth(session): OptionalAuth,
     State(state): State<AppState>,
     Query(q): Query<RssQuery>,
 ) -> HomarrResult<Json<Value>> {
-    let urls: Vec<String> = q
+    let mut urls: Vec<String> = q
         .url
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
+    if !can_query_any_external_target(session.as_ref()) {
+        let kind = WidgetKind::RssFeed;
+        let options = viewable_widget_options(&state, session.as_ref(), kind).await?;
+        let allowed: HashSet<&str> = options
+            .iter()
+            .filter_map(|o| o.get("feedUrls").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let requested = urls.len();
+        urls.retain(|u| allowed.contains(u.as_str()));
+        if requested > 0 && urls.is_empty() {
+            return Err(HomarrError::Forbidden(
+                "Feed URLs must be configured on a board you can view".into(),
+            ));
+        }
+    }
     let entries = state
         .services
         .external
@@ -536,13 +602,40 @@ pub struct MinecraftQuery {
 }
 
 pub async fn external_minecraft(
+    OptionalAuth(session): OptionalAuth,
     State(state): State<AppState>,
     Query(q): Query<MinecraftQuery>,
-) -> Json<Value> {
+) -> HomarrResult<Json<Value>> {
+    let port = q.port.unwrap_or(25565);
+    if !can_query_any_external_target(session.as_ref()) {
+        let kind = WidgetKind::MinecraftServerStatus;
+        let options = viewable_widget_options(&state, session.as_ref(), kind).await?;
+        let configured = options
+            .iter()
+            .filter_map(|o| o.get("domain").and_then(Value::as_str))
+            .any(|domain| minecraft_domain_matches(domain, &q.host, port));
+        if !configured {
+            return Err(HomarrError::Forbidden(
+                "Minecraft server must be configured on a board you can view".into(),
+            ));
+        }
+    }
     let status = state
         .services
         .external
-        .ping_minecraft_server(&q.host, q.port.unwrap_or(25565))
+        .ping_minecraft_server(&q.host, port)
         .await;
-    Json(serde_json::to_value(status).unwrap_or_default())
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+/// Same `host[:port]` parsing as the widget resolver.
+fn minecraft_domain_matches(domain: &str, host: &str, port: u16) -> bool {
+    let domain = domain.trim();
+    match domain
+        .rsplit_once(':')
+        .and_then(|(h, p)| Some((h, p.parse::<u16>().ok()?)))
+    {
+        Some((h, p)) => h == host && p == port,
+        None => domain == host && port == 25565,
+    }
 }

@@ -148,7 +148,7 @@ impl IntegrationRegistry {
             )));
         }
 
-        let auth = self.resolve_http_auth(ctx)?;
+        let auth = crate::http_auth::resolve_http_auth(&self.rt, ctx).await?;
         // Upstream responses (e.g. Sonarr's /config/host) can echo the integration's credentials.
         let redactor = SecretRedactor::new(ctx, &auth);
         let mut query = auth.query;

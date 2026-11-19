@@ -13,7 +13,7 @@ use homarr_db::repos::{
     apps::{self, AppInput},
     boards, integrations, users,
 };
-use homarr_definitions::GroupPermissionKey;
+use homarr_definitions::{GroupPermissionKey, IntegrationPermission};
 use homarr_widgets::all_widget_metadata;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -211,7 +211,7 @@ async fn execute_mcp_tool(
             Ok(serde_json::to_value(full).unwrap_or_default())
         }
         "homarr_list_apps" => {
-            let items = apps::list_all(&state.db).await?;
+            let items = crate::routes::apps::visible_apps(state, Some(session)).await?;
             Ok(json!({ "items": items }))
         }
         "homarr_create_app" => {
@@ -256,7 +256,20 @@ async fn execute_mcp_tool(
             Ok(json!({ "deleted": deleted }))
         }
         "homarr_list_integrations" => {
-            let items = integrations::list_all(&state.db).await?;
+            let mut items = Vec::new();
+            for item in integrations::list_all(&state.db).await? {
+                if homarr_auth::check_integration_permission(
+                    &state.db,
+                    session,
+                    &item.id,
+                    IntegrationPermission::Use,
+                )
+                .await
+                .is_ok()
+                {
+                    items.push(item);
+                }
+            }
             Ok(json!({ "items": items }))
         }
         "homarr_list_widgets" => Ok(json!({ "items": all_widget_metadata() })),

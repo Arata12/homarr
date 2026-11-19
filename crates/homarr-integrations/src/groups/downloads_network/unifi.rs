@@ -18,6 +18,7 @@ use crate::capabilities::network_controller::{
     EnabledStatus, NetworkControllerSummary, UsersSummary, VpnUsersSummary, WwwSummary,
 };
 use crate::error::{check_status, request_error};
+use crate::http_auth::ResolvedHttpAuth;
 use crate::runtime::IntegrationRuntime;
 use crate::types::IntegrationContext;
 
@@ -231,6 +232,52 @@ async fn session(rt: &IntegrationRuntime, ctx: &IntegrationContext) -> HomarrRes
     Ok(session)
 }
 
+/// Credentials for custom widget HTTP requests (port of `getHttpAuthenticationAsync`). The login uses the
+/// saved origin exactly (no port fallback) so the cookie is bound to the origin the request targets, and only
+/// over HTTPS to protect the session cookie.
+pub async fn http_auth(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+) -> HomarrResult<ResolvedHttpAuth> {
+    let url = Url::parse(&ctx.url).map_err(|err| {
+        HomarrError::BadRequest(format!("Invalid integration URL '{}': {err}", ctx.url))
+    })?;
+    if url.scheme() != "https" {
+        return Err(HomarrError::BadRequest(
+            "UniFi generic HTTP requests require an HTTPS integration URL to protect the session cookie"
+                .to_string(),
+        ));
+    }
+    let origin = url.origin().ascii_serialization();
+    let session = match rt.sessions.get::<Session>(ctx) {
+        Some(session) if session.origin == origin => session,
+        _ => {
+            let session = login_at(rt, ctx, &origin, true).await?.ok_or_else(|| {
+                HomarrError::Upstream(format!(
+                    "Unable to connect to the UniFi controller {}",
+                    ctx.name
+                ))
+            })?;
+            rt.sessions.set(ctx, &session, Some(SESSION_TTL));
+            session
+        }
+    };
+    Ok(session_http_auth(session))
+}
+
+fn session_http_auth(session: Session) -> ResolvedHttpAuth {
+    let mut auth = ResolvedHttpAuth {
+        redact_values: vec![session.cookie.clone()],
+        ..Default::default()
+    };
+    auth.headers.insert("Cookie".to_string(), session.cookie);
+    if let Some(csrf) = session.csrf_token {
+        auth.redact_values.push(csrf.clone());
+        auth.headers.insert("X-CSRF-Token".to_string(), csrf);
+    }
+    auth
+}
+
 /// Network API request (`path` without the UniFi OS prefix). Returns the HTTP status and the `data` member.
 /// A 401 drops the cached session and retries once.
 async fn api(
@@ -354,6 +401,19 @@ mod tests {
             {"subsystem": "vpn", "status": "ok", "remote_user_num_active": vpn_remote}
         ]}))
         .unwrap()
+    }
+
+    #[test]
+    fn http_auth_sends_cookie_and_csrf_token() {
+        let auth = session_http_auth(Session {
+            origin: "https://unifi".into(),
+            cookie: "TOKEN=abc".into(),
+            csrf_token: Some("csrf".into()),
+            unifios: true,
+        });
+        assert_eq!(auth.headers["Cookie"], "TOKEN=abc");
+        assert_eq!(auth.headers["X-CSRF-Token"], "csrf");
+        assert_eq!(auth.redact_values, ["TOKEN=abc", "csrf"]);
     }
 
     #[test]

@@ -51,7 +51,7 @@
 - ✨ **92 Integrations &amp; 67 Built-in Widgets** — Native async clients for media servers, `*arr` automation, download clients, DNS sinkholes, hypervisors/UPS/health telemetry, firewalls/VPNs, Traefik/network tools, smart home, stocks, weather, calendars, RSS, and Markdown notebooks
 - 📌 **Fast App Directory &amp; Live Status Pings** — Bundled icon search across local &amp; curated icons plus live HTTP/status dot checks without external browser bloat
 - 👤 **Users, Groups, RBAC &amp; Invites** — Granular permissions per board and integration, first-run Onboarding Studio (`/init`), invite links, one-time revealed API keys (`ApiKey` header), and optional trusted-proxy SSO (`AUTH_TRUSTED_PROXY_HEADER`)
-- 🛡️ **Hardened Security by Default** — Bcrypt password hashing, Node.js-compatible AES-256-CBC/HMAC secret vault, auto-generated persistent secrets in `STATIC_DATA_DIR/secrets` (never logged), HTTPS-aware `Secure` cookies, strict `Origin` CSRF validation, and SSRF-guarded outbound HTTP requests
+- 🛡️ **Hardened Security by Default** — Bcrypt password hashing, Node.js-compatible AES-256-CBC secret vault (unauthenticated, no MAC — same format as upstream Homarr), auto-generated persistent secrets in `STATIC_DATA_DIR/secrets` (never logged), HTTPS-aware `Secure` cookies, strict `Origin` CSRF validation, and SSRF-guarded outbound HTTP requests
 - 🗄️ **SQLite &amp; PostgreSQL (`sqlx`) with Versioned Migrations** — 41-table migrations that seamlessly adopt existing SQLite/PostgreSQL schemas, plus portable JSON workspace Backup &amp; Restore
 - 🕔 **Real-Time WebSockets &amp; Resilient Redis Fallback** — Tokio background cron scheduler (`/manage/tools/tasks`) and `/websockets` streaming; falls back cleanly to in-memory pub/sub in ~12 s if Redis is unavailable
 - 🔍 **Spotlight (`Ctrl+K`) &amp; 36 Languages** — Fuzzy search across boards, apps, integrations, web search bangs (`!prefix`), quick actions, and admin pages with 36 localization catalogs
@@ -97,6 +97,9 @@ Then open **`http://localhost:7575`** — first boot redirects to `/init` to cre
 
 > [!NOTE]
 > If `SECRET_ENCRYPTION_KEY` or `AUTH_SECRET` are omitted, Homarr generates cryptographically random secrets on first start and persists them atomically (`0600`) under `/appdata/secrets/` (`STATIC_DATA_DIR/secrets`) so sessions and encrypted integration credentials survive restarts without exposing keys in logs. A new secret is generated only when the file does not exist; if it exists but is unreadable or invalid (or cannot be written), startup fails instead of replacing it. Both variables also accept `SECRET_ENCRYPTION_KEY_FILE` / `AUTH_SECRET_FILE` (path to a file such as a Docker secret; the plain variable wins if both are set). Deployments started from an older `docker-compose.yml` that defaulted `SECRET_ENCRYPTION_KEY` to the public `0123456789abcdef…` value must set it to that value to keep reading stored integration secrets, then rotate.
+
+> [!IMPORTANT]
+> The images no longer run as root. The distroless release image runs as `65532:65532` (`nonroot`); set compose `user: "<uid>:<gid>"` to change it (PUID/PGID are not supported there). The Debian image built from `Dockerfile` starts as root only to chown `/appdata/{db,secrets,trusted-certificates}`, then drops to `PUID`/`PGID` (default `1000`/`1000`). **Upgrading** a volume created by an older root image: with the release image run `docker run --rm -v homarr_appdata:/appdata busybox chown -R 65532:65532 /appdata` once; the Debian image fixes ownership itself. To reach a mounted `docker.sock`, add `group_add: ["<gid of the socket>"]`.
 
 ### 2. Docker Compose
 
@@ -158,7 +161,7 @@ STATIC_DATA_DIR=./appdata DB_URL=./appdata/db/db.sqlite ASSETS_DIR=./assets ./ho
 | `DB_URL` | `/appdata/db/db.sqlite` | Database connection URL (or `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`) |
 | `ASSETS_DIR` | `assets` (`/app/assets` in Docker) | Path to static CSS/JS, icons, and 36 locale JSON files |
 | `SECRET_ENCRYPTION_KEY` | Auto-persisted (64 hex chars) | AES-256 encryption key for integration secrets (or `SECRET_ENCRYPTION_KEY_FILE`) |
-| `AUTH_SECRET` | Auto-persisted | Session &amp; CSRF signing secret (or `AUTH_SECRET_FILE`) |
+| `AUTH_SECRET` | Auto-persisted | Reserved; generated and persisted but not used by any code today (sessions are random DB-backed tokens) (or `AUTH_SECRET_FILE`) |
 | `AUTH_COOKIE_SECURE` | Auto (`true` on HTTPS) | Explicit override for session cookie `Secure` flag |
 | `AUTH_TRUSTED_PROXY_HEADER` | Unset | Reverse-proxy header name for pre-authenticated SSO username |
 | `AUTH_TRUSTED_PROXY_IPS` | Unset | Comma-separated proxy IPs/CIDRs allowed to send `AUTH_TRUSTED_PROXY_HEADER`; the header is ignored from any other peer (and entirely when unset) |
@@ -166,6 +169,7 @@ STATIC_DATA_DIR=./appdata DB_URL=./appdata/db/db.sqlite ASSETS_DIR=./assets ./ho
 | `DOCKER_SOCKET_PATHS` | `/var/run/docker.sock` | Comma-separated Docker socket paths (or `DOCKER_HOSTNAMES` / `DOCKER_PORTS`) |
 | `ENABLE_KUBERNETES` | `false` | Enable in-cluster Kubernetes inspection tools |
 | `LOG_LEVEL` | `info` | Server log filter level (`trace`, `debug`, `info`, `warn`, `error`) |
+| `PUID` / `PGID` | `1000` / `1000` | Debian `Dockerfile` image only: user/group the server drops to after chowning `/appdata/{db,secrets,trusted-certificates}` (`0`/`0` = root). Not supported by the distroless release image, which always runs as `65532` (use compose `user:`) |
 
 **Admin CLI (`homarr`):**
 
@@ -849,7 +853,7 @@ All **92 integration kinds** and **67 widgets** are compiled natively into `homa
 
 | Crate | Purpose |
 | --- | --- |
-| `homarr-common` | IDs, AES-256-CBC/HMAC encryption, SuperJSON compatibility, grid reflow algorithm, SSRF URL guard |
+| `homarr-common` | IDs, AES-256-CBC encryption (no MAC), keyed HMAC fingerprints, SuperJSON compatibility, grid reflow algorithm, SSRF URL guard |
 | `homarr-definitions` | 67 `WidgetKind`s, 92 `IntegrationKind`s, RBAC permission matrix, layout/section normalization |
 | `homarr-core` | Typed env config (`AppConfig`), persisted secret loader, `LogStore`, TLS certs, `HttpClientFactory` |
 | `homarr-db` | Dual SQLite &amp; PostgreSQL (`sqlx`) 41-table versioned migrations, repos, starter/demo seeding, JSON backup |

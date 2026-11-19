@@ -1,5 +1,7 @@
 //! SABnzbd (port of `download-client/sabnzbd/*`).
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use homarr_common::HomarrResult;
@@ -62,6 +64,36 @@ struct HistorySlot {
     postproc_time: f64,
     name: String,
     bytes: f64,
+}
+
+const SECONDS_PER_DAY: f64 = 86_400.0;
+const ARCHIVED_HISTORY_PAGE_SIZE: usize = 100;
+const MAX_ARCHIVED_HISTORY_PAGES: usize = 100;
+
+fn is_processing(slot: &HistorySlot) -> bool {
+    slot.status != "Completed" && slot.status != "Failed"
+}
+
+/// Port of `getSabnzbdHistorySlotsAsync`: processing active slots first, then finished active and archived
+/// slots completed at or after `cutoff` (epoch seconds), newest first, without duplicate ids.
+fn merge_history(
+    active: Vec<HistorySlot>,
+    archived: Vec<HistorySlot>,
+    cutoff: f64,
+) -> Vec<HistorySlot> {
+    let (processing, finished): (Vec<_>, Vec<_>) = active.into_iter().partition(is_processing);
+    let mut finished: Vec<HistorySlot> = finished
+        .into_iter()
+        .chain(archived)
+        .filter(|slot| !is_processing(slot) && slot.completed >= cutoff)
+        .collect();
+    finished.sort_by(|a, b| b.completed.total_cmp(&a.completed));
+    let mut seen = HashSet::new();
+    processing
+        .into_iter()
+        .chain(finished)
+        .filter(|slot| seen.insert(slot.nzo_id.clone()))
+        .collect()
 }
 
 fn queue_state(status: &str) -> DownloadClientItemState {
@@ -171,6 +203,63 @@ impl Sabnzbd {
         let url = http::url(ctx, "/api", &query)?;
         http::send_json(ctx, http::get(rt, url)).await
     }
+
+    /// Adds archived history within the window to the active history (`includeArchivedHistory`), scanning
+    /// pages until one is short or entirely older than the cutoff.
+    async fn with_archived_history(
+        rt: &IntegrationRuntime,
+        ctx: &IntegrationContext,
+        active: Vec<HistorySlot>,
+        history_window_days: u32,
+        now_ms: f64,
+    ) -> HomarrResult<Vec<HistorySlot>> {
+        let cutoff = (now_ms / 1000.0).floor() - f64::from(history_window_days) * SECONDS_PER_DAY;
+        let limit = ARCHIVED_HISTORY_PAGE_SIZE.to_string();
+        let mut archived = Vec::new();
+        for page in 0..MAX_ARCHIVED_HISTORY_PAGES {
+            let start = (page * ARCHIVED_HISTORY_PAGE_SIZE).to_string();
+            let params = [
+                ("archive", "1"),
+                ("start", start.as_str()),
+                ("limit", limit.as_str()),
+            ];
+            let value = Self::call(rt, ctx, "history", &params).await?;
+            let response: HistoryResponse =
+                http::from_value(ctx, "the SABnzbd archived history", value)?;
+            let slots = response.history.slots;
+            let last = slots.len() < ARCHIVED_HISTORY_PAGE_SIZE
+                || slots.iter().all(|slot| slot.completed < cutoff);
+            archived.extend(slots);
+            if last {
+                break;
+            }
+        }
+        Ok(merge_history(active, archived, cutoff))
+    }
+
+    /// Jobs and status; `archived_history_days` is `historyWindowDays` when the widget's
+    /// `includeArchivedHistory` is on (default 7 days), `None` otherwise.
+    pub(crate) async fn jobs_and_status_with_history(
+        rt: &IntegrationRuntime,
+        ctx: &IntegrationContext,
+        limit: usize,
+        archived_history_days: Option<u32>,
+    ) -> HomarrResult<DownloadClientJobsAndStatus> {
+        let limit_text = limit.to_string();
+        let params = [("limit", limit_text.as_str())];
+        let (queue, history) = tokio::join!(
+            Self::call(rt, ctx, "queue", &params),
+            Self::call(rt, ctx, "history", &params),
+        );
+        let queue: QueueResponse = http::from_value(ctx, "the SABnzbd queue", queue?)?;
+        let mut history: HistoryResponse = http::from_value(ctx, "the SABnzbd history", history?)?;
+        let now_ms = Utc::now().timestamp_millis() as f64;
+        if let Some(days) = archived_history_days {
+            history.history.slots =
+                Self::with_archived_history(rt, ctx, history.history.slots, days, now_ms).await?;
+        }
+        Ok(map_response(queue.queue, history.history, limit, now_ms))
+    }
 }
 
 #[async_trait]
@@ -192,20 +281,9 @@ impl DownloadClient for Sabnzbd {
         limit: usize,
         _selection: Option<&DownloadClientSelection>,
     ) -> HomarrResult<DownloadClientJobsAndStatus> {
-        let limit_text = limit.to_string();
-        let params = [("limit", limit_text.as_str())];
-        let (queue, history) = tokio::join!(
-            Self::call(rt, ctx, "queue", &params),
-            Self::call(rt, ctx, "history", &params),
-        );
-        let queue: QueueResponse = http::from_value(ctx, "the SABnzbd queue", queue?)?;
-        let history: HistoryResponse = http::from_value(ctx, "the SABnzbd history", history?)?;
-        Ok(map_response(
-            queue.queue,
-            history.history,
-            limit,
-            Utc::now().timestamp_millis() as f64,
-        ))
+        // shortcut: the widget's includeArchivedHistory/historyWindowDays options are not passed to download
+        // clients yet; pass them through to `jobs_and_status_with_history` once they are.
+        Self::jobs_and_status_with_history(rt, ctx, limit, None).await
     }
 
     async fn pause_queue(
@@ -309,6 +387,39 @@ mod tests {
         assert_eq!(out.items[2].state, DownloadClientItemState::Failed);
         assert_eq!(out.items[2].time, 1_000_000.0 - 2_000_000.0);
         assert_eq!(out.items[2].added, Some((1000.0 - 90.0) * 1000.0));
+    }
+
+    fn slot(id: &str, status: &str, completed: f64) -> HistorySlot {
+        HistorySlot {
+            category: String::new(),
+            download_time: 0.0,
+            status: status.into(),
+            completed,
+            nzo_id: id.into(),
+            postproc_time: 0.0,
+            name: String::new(),
+            bytes: 0.0,
+        }
+    }
+
+    #[test]
+    fn merges_archived_history_within_window() {
+        let active = vec![
+            slot("old", "Completed", 50.0),
+            slot("running", "Extracting", 0.0),
+            slot("a", "Completed", 200.0),
+        ];
+        let archived = vec![
+            slot("a", "Completed", 200.0),
+            slot("b", "Failed", 300.0),
+            slot("edge", "Completed", 100.0),
+            slot("archived-running", "Verifying", 400.0),
+        ];
+        let ids: Vec<String> = merge_history(active, archived, 100.0)
+            .into_iter()
+            .map(|slot| slot.nzo_id)
+            .collect();
+        assert_eq!(ids, ["running", "b", "a", "edge"]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use cron::Schedule;
 use homarr_common::{HomarrError, HomarrResult, SecretCrypto};
 use homarr_core::AppConfig;
 use homarr_db::{
-    repos::{apps, integrations, settings},
+    repos::{apps, integrations, sessions, settings},
     Database,
 };
 use homarr_definitions::IntegrationKind;
@@ -152,6 +152,15 @@ const BUILTIN_JOBS: &[JobSpec] = &[
         description: "Checks cached external software releases",
         default_cron: "0 */30 * * * *",
         run_on_start: false,
+        prevent_manual_execution: false,
+        prevent_custom_interval: false,
+        hidden: false,
+    },
+    JobSpec {
+        name: "sessionCleanup",
+        description: "Deletes expired login sessions",
+        default_cron: "0 0 * * * *",
+        run_on_start: true,
         prevent_manual_execution: false,
         prevent_custom_interval: false,
         hidden: false,
@@ -446,6 +455,12 @@ impl TaskScheduler {
                 let _ = self.services.external.check_updates().await;
                 Ok(())
             }
+            "sessionCleanup" => {
+                let deleted =
+                    sessions::delete_expired(&self.db, Utc::now().timestamp_millis()).await?;
+                tracing::debug!(deleted, "Deleted expired sessions");
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -672,6 +687,11 @@ mod tests {
         assert!(visible.iter().any(|j| j.name == "ping"));
         assert!(!visible.iter().any(|j| j.name == "analytics"));
         assert!(all.iter().any(|j| j.name == "analytics"));
+        assert!(visible.iter().any(|j| j.name == "sessionCleanup"));
+
+        // Session cleanup runs against the real schema without error
+        let cleanup = scheduler.trigger_job("sessionCleanup").await.unwrap();
+        assert!(cleanup.last_error.is_none(), "{:?}", cleanup.last_error);
 
         // Manual execution on analytics is forbidden
         assert!(scheduler.trigger_job("analytics").await.is_err());

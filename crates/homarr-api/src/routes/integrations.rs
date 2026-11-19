@@ -218,7 +218,7 @@ pub async fn test_integration(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> HomarrResult<Json<Value>> {
-    check_integration_permission(&state.db, &session, &id, IntegrationPermission::Interact).await?;
+    check_integration_permission(&state.db, &session, &id, IntegrationPermission::Full).await?;
     let ctx = load_ctx(&state, &id).await?;
     let res = state.integrations.test_connection(&ctx).await;
     Ok(Json(serde_json::to_value(res).unwrap_or_default()))
