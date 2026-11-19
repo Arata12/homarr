@@ -74,9 +74,36 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> HomarrResult<()> {
+        self.ensure_not_legacy_database().await?;
         match self {
             Self::Sqlite(pool) => SQLITE_MIGRATOR.run(pool).await.map_err(map_migrate_err)?,
             Self::Postgres(pool) => POSTGRES_MIGRATOR.run(pool).await.map_err(map_migrate_err)?,
+        }
+        Ok(())
+    }
+
+    /// Homarr v1 (Next.js/Drizzle) databases have a different schema; running the v3 schema with
+    /// `IF NOT EXISTS` over them would silently leave mismatched tables, so refuse to start.
+    async fn ensure_not_legacy_database(&self) -> HomarrResult<()> {
+        let legacy_tables: i64 = match self {
+            Self::Sqlite(pool) => sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '__drizzle_migrations'",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_err)?,
+            Self::Postgres(pool) => sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '__drizzle_migrations'",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_err)?,
+        };
+        if legacy_tables > 0 {
+            return Err(HomarrError::Database(
+                "This database was created by Homarr v1 (Drizzle migrations found) and is not                  compatible with Homarr v3. Point DB_URL at a new database."
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -133,4 +160,25 @@ pub fn map_sqlx_err(err: sqlx::Error) -> HomarrError {
         return HomarrError::NotFound("Record not found".to_string());
     }
     HomarrError::Database(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_refuses_homarr_v1_database() {
+        let db = Database::connect(DatabaseDriver::Sqlite, "sqlite::memory:")
+            .await
+            .unwrap();
+        let Database::Sqlite(pool) = &db else {
+            unreachable!()
+        };
+        sqlx::query("CREATE TABLE __drizzle_migrations (id INTEGER PRIMARY KEY, hash TEXT)")
+            .execute(pool)
+            .await
+            .unwrap();
+        let err = db.migrate().await.unwrap_err();
+        assert!(err.to_string().contains("Homarr v1"), "{err}");
+    }
 }

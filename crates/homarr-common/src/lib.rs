@@ -19,5 +19,6 @@ pub use grid_algorithm::{
 pub use id::{create_id, generate_secure_random_token};
 pub use superjson::{deserialize_superjson, serialize_superjson, EMPTY_SUPERJSON};
 pub use url::{
-    is_blocked_ip, is_http_url, redact_url_query, remove_trailing_slash, validate_outbound_url,
+    ip_matches_any, is_blocked_ip, is_http_url, redact_url_query, remove_trailing_slash,
+    validate_outbound_url,
 };

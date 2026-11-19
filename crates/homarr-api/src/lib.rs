@@ -350,9 +350,14 @@ mod tests {
     use tower::ServiceExt;
 
     async fn setup_test_state() -> (AppState, Router) {
+        setup_test_state_with(|_| {}).await
+    }
+
+    async fn setup_test_state_with(configure: impl FnOnce(&mut AppConfig)) -> (AppState, Router) {
         let mut cfg = AppConfig::for_test();
         cfg.demo_mode = true;
         cfg.demo_read_only = false;
+        configure(&mut cfg);
         let certs = CertificateManager::new(cfg.local_certificate_path.clone());
         let http = HttpClientFactory::new(&certs).unwrap();
         let db = Database::connect(DatabaseDriver::Sqlite, "sqlite::memory:")
@@ -554,5 +559,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ws_resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn onboarding_update_requires_admin_once_a_user_exists() {
+        let (_state, app) = setup_test_state().await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/onboarding")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"step":"finish"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_header_requires_allowed_peer_address() {
+        let (_state, app) = setup_test_state_with(|cfg| {
+            cfg.auth_trusted_proxy_header = Some("Remote-User".to_string());
+            cfg.auth_trusted_proxy_ips = vec!["10.0.0.0/8".to_string()];
+        })
+        .await;
+
+        async fn authenticated(app: &Router, peer: Option<&str>) -> bool {
+            let mut req = Request::get("/api/auth/session")
+                .header("Remote-User", "demo")
+                .body(Body::empty())
+                .unwrap();
+            if let Some(peer) = peer {
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                        peer.parse().unwrap(),
+                    ));
+            }
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            body["authenticated"].as_bool().unwrap()
+        }
+
+        assert!(!authenticated(&app, None).await);
+        assert!(!authenticated(&app, Some("203.0.113.9:4000")).await);
+        assert!(authenticated(&app, Some("10.1.2.3:4000")).await);
     }
 }

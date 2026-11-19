@@ -161,6 +161,7 @@ STATIC_DATA_DIR=./appdata DB_URL=./appdata/db/db.sqlite ASSETS_DIR=./assets ./ho
 | `AUTH_SECRET` | Auto-persisted | Session &amp; CSRF signing secret |
 | `AUTH_COOKIE_SECURE` | Auto (`true` on HTTPS) | Explicit override for session cookie `Secure` flag |
 | `AUTH_TRUSTED_PROXY_HEADER` | Unset | Reverse-proxy header name for pre-authenticated SSO username |
+| `AUTH_TRUSTED_PROXY_IPS` | Unset | Comma-separated proxy IPs/CIDRs allowed to send `AUTH_TRUSTED_PROXY_HEADER`; the header is ignored from any other peer (and entirely when unset) |
 | `REDIS_IS_EXTERNAL` / `REDIS_DISABLED` | `false` / `false` | Use external Redis (`REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`) with ~12 s memory fallback |
 | `DOCKER_SOCKET_PATHS` | `/var/run/docker.sock` | Comma-separated Docker socket paths (or `DOCKER_HOSTNAMES` / `DOCKER_PORTS`) |
 | `ENABLE_KUBERNETES` | `false` | Enable in-cluster Kubernetes inspection tools |

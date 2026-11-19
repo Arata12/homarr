@@ -288,7 +288,7 @@ pub struct ExecuteCwBody {
 }
 
 pub async fn execute_custom_widget(
-    RequireAuth(_session): RequireAuth,
+    RequireAuth(session): RequireAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<ExecuteCwBody>,
@@ -300,6 +300,7 @@ pub async fn execute_custom_widget(
             &state.db,
             &state.crypto,
             &state.integrations,
+            Some(&session),
             &id,
             &body.request_id,
             &body.options,
