@@ -3,11 +3,14 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use homarr_auth::RequireAuth;
+use homarr_auth::{can_view_board, AuthSession, OptionalAuth, RequireAuth};
 use homarr_common::{HomarrError, HomarrResult};
 use homarr_db::{
     models::AppRecord,
-    repos::apps::{self, AppInput},
+    repos::{
+        apps::{self, AppInput},
+        boards, settings,
+    },
 };
 use homarr_definitions::GroupPermissionKey;
 use serde::Deserialize;
@@ -103,10 +106,64 @@ pub async fn delete_app(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PingBody {
-    pub url: String,
+    pub app_id: String,
 }
 
-pub async fn ping_url(State(state): State<AppState>, Json(body): Json<PingBody>) -> Json<Value> {
-    let res = state.services.ping.ping_url(&body.url).await;
-    Json(serde_json::to_value(res).unwrap_or_default())
+/// Pings an app's stored URL. Only apps placed on a board the caller can view
+/// (or any app for admins) may be pinged, so the endpoint can't probe arbitrary hosts.
+pub async fn ping_url(
+    OptionalAuth(session): OptionalAuth,
+    State(state): State<AppState>,
+    Json(body): Json<PingBody>,
+) -> HomarrResult<Json<Value>> {
+    let board_cfg = settings::get_setting(&state.db, "board").await?;
+    if board_cfg
+        .get("forceDisableStatus")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(HomarrError::Forbidden(
+            "Ping functionality is disabled by server settings".into(),
+        ));
+    }
+
+    // Same 404 for "missing" and "not visible" to avoid app-id enumeration.
+    let not_found = || HomarrError::NotFound("App not found".into());
+    let app = apps::get_by_id(&state.db, &body.app_id)
+        .await?
+        .ok_or_else(not_found)?;
+    let is_admin = session.as_ref().is_some_and(|s| s.is_admin());
+    if !is_admin && !app_on_viewable_board(&state, session.as_ref(), &app.id).await? {
+        return Err(not_found());
+    }
+
+    let url = app
+        .ping_url
+        .as_deref()
+        .or(app.href.as_deref())
+        .filter(|u| !u.trim().is_empty())
+        .ok_or_else(|| HomarrError::Conflict("No URL to ping configured for this app".into()))?;
+    let res = state.services.ping.ping_url(url).await;
+    Ok(Json(serde_json::to_value(res).unwrap_or_default()))
+}
+
+async fn app_on_viewable_board(
+    state: &AppState,
+    session: Option<&AuthSession>,
+    app_id: &str,
+) -> HomarrResult<bool> {
+    for board in boards::list_all(&state.db).await? {
+        if !can_view_board(&state.db, session, &board).await? {
+            continue;
+        }
+        let Some(full) = boards::get_full_board_by_id(&state.db, &board.id).await? else {
+            continue;
+        };
+        if full.items.iter().any(|item| {
+            item.kind == "app" && item.options.get("appId").and_then(|v| v.as_str()) == Some(app_id)
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

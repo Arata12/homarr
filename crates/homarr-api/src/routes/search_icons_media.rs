@@ -14,7 +14,7 @@ use homarr_db::repos::{
     search_engines::{self, SearchEngineInput},
 };
 use homarr_definitions::GroupPermissionKey;
-use homarr_services::ImageProxyResult;
+use homarr_services::{image_proxy::is_image_content_type, ImageProxyResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -269,10 +269,23 @@ pub async fn image_proxy_get(
         ImageProxyResult::Bytes { content_type, data } => {
             let mut resp = Response::new(Body::from(data));
             *resp.status_mut() = StatusCode::OK;
-            if let Ok(ct) = HeaderValue::from_str(&content_type) {
-                resp.headers_mut().insert(header::CONTENT_TYPE, ct);
-            }
-            resp.headers_mut().insert(
+            let headers = resp.headers_mut();
+            // Upstream bytes are untrusted: only image/* passes through, and the sandbox CSP
+            // keeps SVG/HTML from ever executing as a document on Homarr's origin.
+            let ct = HeaderValue::from_str(&content_type)
+                .ok()
+                .filter(|_| is_image_content_type(&content_type))
+                .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
+            headers.insert(header::CONTENT_TYPE, ct);
+            headers.insert(
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static("sandbox; default-src 'none'; style-src 'unsafe-inline'"),
+            );
+            headers.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            headers.insert(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=3600"),
             );
@@ -290,11 +303,11 @@ pub struct ForwardImageBody {
 }
 
 pub async fn image_proxy_forward(
-    RequireAuth(session): RequireAuth,
+    homarr_auth::RequireAdmin(admin): homarr_auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<ForwardImageBody>,
 ) -> HomarrResult<Json<Value>> {
-    let _ = session;
+    admin.require_writable(state.demo_read_only_active())?;
     let proxied_url = state
         .services
         .image_proxy

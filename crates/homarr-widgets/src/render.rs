@@ -389,7 +389,7 @@ fn render_app(options: &Value, data: &Value) -> String {
     };
 
     format!(
-        r#"<a class="app-tile" href="{href}" target="_blank" rel="noopener noreferrer" data-ping-url="{ping}" title="{title_attr}">
+        r#"<a class="app-tile" href="{href}" target="_blank" rel="noopener noreferrer" data-ping-url="{ping}" data-app-id="{app_id}" title="{title_attr}">
   <img class="app-icon" src="{icon}" alt="{alt_name}" loading="lazy" onerror="this.onerror=null;this.src='/logo/homarr.svg'" />
   {title_html}
   {ping_badge}
@@ -397,6 +397,7 @@ fn render_app(options: &Value, data: &Value) -> String {
         href = encode_attr(href),
         icon = encode_attr(icon),
         ping = encode_attr(ping_url),
+        app_id = encode_attr(app.get("id").and_then(|v| v.as_str()).unwrap_or("")),
         title_attr = encode_attr(&title_raw),
         alt_name = encode_attr(name_raw),
     )

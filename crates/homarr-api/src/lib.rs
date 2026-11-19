@@ -314,7 +314,10 @@ pub fn api_router(state: AppState) -> Router {
             get(mcp::oauth_protected_resource),
         )
         .route("/api/mcp/oauth/register", post(mcp::oauth_register))
-        .route("/api/mcp/oauth/authorize", get(mcp::oauth_authorize))
+        .route(
+            "/api/mcp/oauth/authorize",
+            get(mcp::oauth_authorize).post(mcp::oauth_authorize_decision),
+        )
         .route("/api/mcp/oauth/token", post(mcp::oauth_token))
         // WebSockets (explicitly reject ApiKey header before WebSocketUpgrade)
         .route(
@@ -607,5 +610,416 @@ mod tests {
         assert!(!authenticated(&app, None).await);
         assert!(!authenticated(&app, Some("203.0.113.9:4000")).await);
         assert!(authenticated(&app, Some("10.1.2.3:4000")).await);
+    }
+
+    async fn login_cookie(app: &Router, name: &str, password: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "name": name, "password": password }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn send_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .header(header::ORIGIN, "http://localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        let resp = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn create_regular_user(app: &Router, admin: &str, name: &str, password: &str) -> String {
+        let (status, created) = send_json(
+            app,
+            "POST",
+            "/api/users",
+            Some(admin),
+            json!({ "name": name, "password": password }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create user: {created}");
+        created["user"]["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn image_proxy_forward_requires_admin() {
+        let (_state, app) = setup_test_state().await;
+        let body = json!({ "url": "https://example.com/x.html" });
+        let (status, _) =
+            send_json(&app, "POST", "/api/image-proxy/forward", None, body.clone()).await;
+        assert!(matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+
+        let admin = login_cookie(&app, "demo", "demo").await;
+        create_regular_user(&app, &admin, "viewer", "viewerpass1").await;
+        let viewer = login_cookie(&app, "viewer", "viewerpass1").await;
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/api/image-proxy/forward",
+            Some(&viewer),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn app_ping_rejects_raw_urls_and_unknown_apps() {
+        let (_state, app) = setup_test_state().await;
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/api/apps/ping",
+            None,
+            json!({ "url": "http://127.0.0.1" }),
+        )
+        .await;
+        assert!(status.is_client_error(), "got {status}");
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/api/apps/ping",
+            None,
+            json!({ "appId": "does-not-exist" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_keys_require_admin() {
+        let (_state, app) = setup_test_state().await;
+        let admin = login_cookie(&app, "demo", "demo").await;
+        create_regular_user(&app, &admin, "alice", "alicepass1").await;
+        let alice = login_cookie(&app, "alice", "alicepass1").await;
+        let (status, _) = send_json(&app, "POST", "/api/api-keys", Some(&alice), json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = send_json(&app, "POST", "/api/api-keys", Some(&admin), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn changing_own_password_requires_previous_password() {
+        let (_state, app) = setup_test_state().await;
+        let admin = login_cookie(&app, "demo", "demo").await;
+        let bob_id = create_regular_user(&app, &admin, "bob", "bobpass12").await;
+        let uri = format!("/api/users/{bob_id}");
+        let bob = login_cookie(&app, "bob", "bobpass12").await;
+
+        let (status, _) = send_json(
+            &app,
+            "PATCH",
+            &uri,
+            Some(&bob),
+            json!({ "password": "newpass123" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send_json(
+            &app,
+            "PATCH",
+            &uri,
+            Some(&bob),
+            json!({ "password": "newpass123", "previousPassword": "wrongpass" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send_json(
+            &app,
+            "PATCH",
+            &uri,
+            Some(&bob),
+            json!({ "password": "newpass123", "previousPassword": "bobpass12" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        login_cookie(&app, "bob", "newpass123").await;
+
+        // Admins resetting someone else's password do not need the previous one.
+        let (status, _) = send_json(
+            &app,
+            "PATCH",
+            &uri,
+            Some(&admin),
+            json!({ "password": "adminset1" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn modify_permission_cannot_publish_board_or_add_custom_widget() {
+        let (state, app) = setup_test_state().await;
+        let admin = login_cookie(&app, "demo", "demo").await;
+        let user_id = create_regular_user(&app, &admin, "modifier", "modifier1").await;
+        let user = login_cookie(&app, "modifier", "modifier1").await;
+        let board = repos::boards::create_board_with_defaults(
+            &state.db,
+            repos::boards::CreateBoardInput {
+                id: None,
+                name: "private-board".into(),
+                is_public: false,
+                creator_id: None,
+                column_count: 10,
+            },
+        )
+        .await
+        .unwrap();
+        let board_id = board.board.id.clone();
+
+        let (status, body) = send_json(
+            &app,
+            "PUT",
+            &format!("/api/boards/{board_id}/permissions"),
+            Some(&admin),
+            json!({ "users": [{ "userId": user_id, "permission": "modify" }] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "set permissions: {body}");
+
+        let (status, _) = send_json(
+            &app,
+            "PATCH",
+            &format!("/api/boards/{board_id}"),
+            Some(&user),
+            json!({ "isPublic": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let stored = repos::boards::get_by_id(&state.db, &board_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.is_public);
+
+        let custom_item = json!({
+            "id": "",
+            "kind": "customApi",
+            "options": { "customWidgetId": "cw" },
+            "layouts": [{
+                "itemId": "",
+                "sectionId": board.sections[0].id,
+                "layoutId": board.layouts[0].id,
+                "xOffset": 0, "yOffset": 0, "width": 1, "height": 1
+            }]
+        });
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            &format!("/api/boards/{board_id}/items"),
+            Some(&user),
+            custom_item,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    async fn mcp_approve(app: &Router, cookie: &str, client_id: &str, challenge: &str) -> String {
+        let uri = format!(
+            "/api/mcp/oauth/authorize?response_type=code&client_id={client_id}\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb&code_challenge={challenge}\
+             &code_challenge_method=S256&state=a%26b%3Dc"
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(uri)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let pending = html
+            .split(r#"name="pending" value=""#)
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/mcp/oauth/authorize")
+                    .header(header::COOKIE, cookie)
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("pending={pending}&decision=approve")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = url::Url::parse(resp.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        assert!(location.as_str().starts_with("http://127.0.0.1:9999/cb?"));
+        let pairs: std::collections::HashMap<String, String> =
+            location.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("state").map(String::as_str), Some("a&b=c"));
+        pairs["code"].clone()
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_requires_registered_client_consent_post_and_pkce() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let (state, app) = setup_test_state().await;
+        let cookie = login_cookie(&app, "demo", "demo").await;
+
+        // Old attack: GET with approve=1 for an unregistered client must not redirect with a code.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/mcp/oauth/authorize?client_id=evil\
+                     &redirect_uri=https%3A%2F%2Fevil.example%2Fcb&approve=1&state=x",
+                )
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!resp.status().is_redirection());
+        assert!(resp.headers().get(header::LOCATION).is_none());
+
+        let (status, reg) = send_json(
+            &app,
+            "POST",
+            "/api/mcp/oauth/register",
+            None,
+            json!({ "client_name": "Test", "redirect_uris": ["http://127.0.0.1:9999/cb"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "register: {reg}");
+        let client_id = reg["client_id"].as_str().unwrap().to_string();
+
+        // Registered client but unregistered redirect_uri: no redirect.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/mcp/oauth/authorize?response_type=code&client_id={client_id}\
+                     &redirect_uri=https%3A%2F%2Fevil.example%2Fcb&code_challenge={}\
+                     &code_challenge_method=S256",
+                    "A".repeat(43)
+                ))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Decision POST without Origin is rejected.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/mcp/oauth/authorize")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("pending=x&decision=approve"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let verifier = "v".repeat(43);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let token_req = |code: &str, verifier: &str| {
+            Request::post("/api/mcp/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=authorization_code&code={code}&client_id={client_id}\
+                     &redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb&code_verifier={verifier}"
+                )))
+                .unwrap()
+        };
+
+        // Happy path: correct verifier yields a read-only key; the code is single-use.
+        let code = mcp_approve(&app, &cookie, &client_id, &challenge).await;
+        let resp = app
+            .clone()
+            .oneshot(token_req(&code, &verifier))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let tok: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(tok["scope"], "mcp:tools:read");
+        let sess =
+            homarr_auth::authenticate_api_key(&state.db, tok["access_token"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(sess.api_key_read_only);
+        let resp = app
+            .clone()
+            .oneshot(token_req(&code, &verifier))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong verifier fails.
+        let code = mcp_approve(&app, &cookie, &client_id, &challenge).await;
+        let resp = app
+            .clone()
+            .oneshot(token_req(&code, &"w".repeat(43)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

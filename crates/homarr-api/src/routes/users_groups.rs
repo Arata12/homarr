@@ -4,7 +4,7 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use homarr_auth::{hash_password, RequireAdmin, RequireAuth};
+use homarr_auth::{hash_password, verify_password, RequireAdmin, RequireAuth};
 use homarr_common::{HomarrError, HomarrResult};
 use homarr_db::repos::{
     groups, invites,
@@ -86,6 +86,7 @@ pub struct UpdateUserBody {
     pub email: Option<String>,
     pub image: Option<String>,
     pub password: Option<String>,
+    pub previous_password: Option<String>,
 }
 
 pub async fn update_user(
@@ -103,6 +104,29 @@ pub async fn update_user(
         return Err(HomarrError::BadRequest(
             "Password must be >= 8 chars".into(),
         ));
+    }
+    if new_password.is_some() {
+        let target = users::find_by_id(&state.db, &id)
+            .await?
+            .ok_or_else(|| HomarrError::NotFound("User not found".into()))?;
+        if target.provider != "credentials" {
+            return Err(HomarrError::Forbidden(
+                "Password can only be changed for credentials users".into(),
+            ));
+        }
+        // Changing your own password (admins too) requires the current one, as upstream.
+        if session.user_id == id {
+            let previous = body.previous_password.as_deref().unwrap_or_default();
+            let valid = match target.password.as_deref() {
+                Some(hash) if !previous.is_empty() => verify_password(previous, hash).await?,
+                _ => false,
+            };
+            if !valid {
+                return Err(HomarrError::BadRequest(
+                    "Current password is missing or incorrect".into(),
+                ));
+            }
+        }
     }
     users::update_profile(
         &state.db,

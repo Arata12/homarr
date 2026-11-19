@@ -1106,6 +1106,7 @@ name = "homarr-api"
 version = "3.0.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "homarr-auth",
  "homarr-common",
@@ -1120,6 +1121,7 @@ dependencies = [
  "html-escape",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
  "tracing",

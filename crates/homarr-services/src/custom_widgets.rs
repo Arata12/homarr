@@ -197,6 +197,10 @@ impl CustomWidgetService {
                 headers.insert(hdr_name.to_string(), v.clone());
             }
         }
+        // Upstream responses may echo the source's credentials back; never show them to viewers.
+        let redactor = homarr_integrations::http_auth::SecretRedactor::from_values(
+            secrets.values().chain(headers.values()).map(String::as_str),
+        );
 
         if method.eq_ignore_ascii_case("GET") {
             let (bytes, _, status) = self
@@ -206,7 +210,7 @@ impl CustomWidgetService {
             let text = String::from_utf8_lossy(&bytes);
             let parsed = serde_json::from_str::<Value>(&text)
                 .unwrap_or_else(|_| Value::String(text.into_owned()));
-            return Ok(json!({ "status": status, "data": parsed }));
+            return Ok(json!({ "status": status, "data": redactor.redact_value(parsed) }));
         }
 
         let req_method = Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
@@ -226,7 +230,7 @@ impl CustomWidgetService {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         let parsed = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
-        Ok(json!({ "status": status, "data": parsed }))
+        Ok(json!({ "status": status, "data": redactor.redact_value(parsed) }))
     }
 
     pub async fn fetch_workshop_listings(
@@ -445,21 +449,37 @@ fn validate_template_safety(template: &str) -> HomarrResult<()> {
 }
 
 /// Renders a Custom Widget template replacing `{{path.to.value}}` placeholders with HTML-escaped data.
+/// Values are escaped for quoted attributes too, and script URLs are defanged with an `unsafe:`
+/// prefix because a placeholder may sit inside `href`/`src`.
 pub fn render_template(template: &str, data: &Value, options: &HashMap<String, Value>) -> String {
+    let escape = |v: &Value| {
+        let raw = value_to_string(v);
+        // Browsers ignore leading/embedded whitespace and control characters in a URL scheme.
+        let scheme = raw
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
+            .take(11)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let raw = if scheme.starts_with("javascript:") || scheme.starts_with("vbscript:") {
+            format!("unsafe:{raw}")
+        } else {
+            raw
+        };
+        html_escape::encode_quoted_attribute(&raw).into_owned()
+    };
     let re = Regex::new(r"\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}").expect("valid placeholder regex");
     re.replace_all(template, |caps: &regex::Captures<'_>| {
         let key = &caps[1];
         if let Some(opt_key) = key.strip_prefix("options.") {
             if let Some(v) = options.get(opt_key) {
-                return html_escape::encode_text(&value_to_string(v)).into_owned();
+                return escape(v);
             }
         }
         let lookup_key = key.strip_prefix("data.").unwrap_or(key);
-        if let Some(val) = lookup_json_path(data, lookup_key) {
-            html_escape::encode_text(&value_to_string(val)).into_owned()
-        } else {
-            String::new()
-        }
+        lookup_json_path(data, lookup_key)
+            .map(&escape)
+            .unwrap_or_default()
     })
     .into_owned()
 }
@@ -511,6 +531,19 @@ fn value_to_string(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_template_escapes_attributes_and_script_urls() {
+        let options = HashMap::from([("t".to_string(), json!("x\" onmouseover='y'"))]);
+        let html = render_template(
+            r#"<a href="{{data.u}}" title="{{options.t}}">"#,
+            &json!({ "u": " \tJavaScript:alert(1)" }),
+            &options,
+        );
+        assert!(!html.contains("\" onmouseover"));
+        assert!(!html.contains("'y'"));
+        assert!(html.contains("href=\"unsafe:"));
+    }
 
     #[test]
     fn same_origin_allows_paths_on_source() {
