@@ -580,7 +580,7 @@ pub async fn users_page(
       <div class="form-row"><label>Username</label><input name="name" required minlength="2" /></div>
       <div class="form-row"><label>Email</label><input name="email" type="email" /></div>
     </div>
-    <div class="form-row"><label>Password</label><input name="password" type="password" required minlength="4" /></div>
+    <div class="form-row"><label>Password</label><input name="password" type="password" required minlength="8" /></div>
     <div><button type="submit" class="btn btn-primary">Create User</button></div>
   </form>
 </div>

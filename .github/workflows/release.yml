@@ -1,13 +1,17 @@
 name: Release (Rust binaries + Docker images)
 
-# On every published GitHub release:
-#   1. Build static (musl) binaries natively on x64 and arm64 runners.
-#   2. Attach linux-amd64 / linux-arm64 tarballs to the release.
-#   3. Package those same binaries into a distroless image per architecture
+# On every pushed v* tag, published GitHub release, or manual workflow_dispatch:
+#   1. Ensure the GitHub release exists and resolve tag/version metadata.
+#   2. Build static (musl) binaries natively on x64 and arm64 runners.
+#   3. Attach linux-amd64 / linux-arm64 tarballs to the release.
+#   4. Package those same binaries into a distroless image per architecture
 #      (ghcr.io/<owner>/homarr:<version>-amd64 / -arm64).
-#   4. Publish a multi-arch manifest (<version>, and latest for stable releases).
+#   5. Publish a multi-arch manifest (<version>, and latest for stable releases).
 
 on:
+  push:
+    tags:
+      - "v*"
   release:
     types: [published]
   workflow_dispatch:
@@ -20,18 +24,60 @@ on:
 permissions: {}
 
 concurrency:
-  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  group: release-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
   # Native musl toolchain: Alpine targets *-unknown-linux-musl and links statically.
   RUST_IMAGE: rust:1-alpine
   BINARIES: homarr-server homarr homarr-workshop
 
 jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Ensure GitHub release exists and resolve metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]]; then
+            echo "Invalid tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            pre_flag=()
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              pre_flag=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Homarr $RELEASE_TAG" \
+              --generate-notes \
+              "${pre_flag[@]}"
+          fi
+          prerelease=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "version=${RELEASE_TAG#v}"
+            echo "prerelease=$prerelease"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -48,25 +94,9 @@ jobs:
             target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     steps:
-      - name: Resolve release metadata
-        id: meta
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            echo "Invalid tag: $RELEASE_TAG" >&2; exit 1
-          fi
-          prerelease=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
-          {
-            echo "version=${RELEASE_TAG#v}"
-            echo "prerelease=$prerelease"
-            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
-          } >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.prepare.outputs.tag }}
           persist-credentials: false
 
       - name: Cache cargo registry and target
@@ -114,7 +144,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
-          VERSION: ${{ steps.meta.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           name="homarr-${VERSION}-linux-${ARCH}"
@@ -145,9 +175,9 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           STAGE: ${{ steps.package.outputs.stage }}
-          IMAGE: ${{ steps.meta.outputs.image }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
           tags=(-t "$IMAGE:$VERSION-$ARCH")
@@ -167,26 +197,13 @@ jobs:
 
   manifest:
     name: Multi-arch manifest
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Resolve release metadata
-        id: meta
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          prerelease=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
-          {
-            echo "version=${RELEASE_TAG#v}"
-            echo "prerelease=$prerelease"
-            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
@@ -196,9 +213,9 @@ jobs:
 
       - name: Create and push manifest
         env:
-          IMAGE: ${{ steps.meta.outputs.image }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
           tags=(-t "$IMAGE:$VERSION")
