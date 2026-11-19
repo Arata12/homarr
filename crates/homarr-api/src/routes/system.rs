@@ -152,6 +152,7 @@ pub async fn upload_certificate(
 ) -> HomarrResult<(StatusCode, Json<Value>)> {
     admin.require_writable(state.demo_read_only_active())?;
     state.certs.save(&body.file_name, &body.content)?;
+    state.http.reload()?;
     Ok((StatusCode::CREATED, Json(json!({ "ok": true }))))
 }
 
@@ -162,6 +163,7 @@ pub async fn delete_certificate(
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
     state.certs.remove(&name)?;
+    state.http.reload()?;
     Ok(Json(json!({ "deleted": true })))
 }
 

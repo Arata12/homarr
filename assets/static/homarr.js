@@ -754,28 +754,25 @@
   }
 
   // Immediate live ping check for unknown app tiles on board load
-  const pendingUrls = [];
-  const seenUrls = new Set();
-  document.querySelectorAll(".app-tile[data-ping-url]").forEach((tile) => {
-    const raw = (tile.getAttribute("data-ping-url") || "").trim();
-    const dot = tile.querySelector(".ping-dot.unknown");
-    if (dot && (raw.startsWith("http://") || raw.startsWith("https://")) && !seenUrls.has(raw) && pendingUrls.length < 16) {
-      seenUrls.add(raw);
-      pendingUrls.push(raw);
+  const pendingAppIds = [];
+  document.querySelectorAll(".app-tile[data-app-id]").forEach((tile) => {
+    const appId = (tile.getAttribute("data-app-id") || "").trim();
+    if (appId && tile.querySelector(".ping-dot.unknown") && !pendingAppIds.includes(appId) && pendingAppIds.length < 16) {
+      pendingAppIds.push(appId);
     }
   });
-  pendingUrls.forEach((pingUrl) => {
+  pendingAppIds.forEach((appId) => {
     fetch("/api/apps/ping", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: pingUrl }),
+      body: JSON.stringify({ appId }),
     })
       .then((r) => (r.ok ? r.json() : null))
       .then((res) => {
         if (!res) return;
         const ok = res.statusCode && res.statusCode < 400;
         document
-          .querySelectorAll('.app-tile[data-ping-url="' + CSS.escape(pingUrl) + '"] .ping-dot')
+          .querySelectorAll('.app-tile[data-app-id="' + CSS.escape(appId) + '"] .ping-dot')
           .forEach((dot) => {
             dot.classList.remove("unknown", "up", "down");
             dot.classList.add(ok ? "up" : "down");

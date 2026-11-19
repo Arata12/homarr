@@ -96,7 +96,7 @@ docker run -d \
 Then open **`http://localhost:7575`** — first boot redirects to `/init` to create the administrator account, choose your color scheme, and optionally seed a starter dashboard.
 
 > [!NOTE]
-> If `SECRET_ENCRYPTION_KEY` or `AUTH_SECRET` are omitted, Homarr generates cryptographically random secrets on first start and persists them atomically (`0600`) under `/appdata/secrets/` (`STATIC_DATA_DIR/secrets`) so sessions and encrypted integration credentials survive restarts without exposing keys in logs.
+> If `SECRET_ENCRYPTION_KEY` or `AUTH_SECRET` are omitted, Homarr generates cryptographically random secrets on first start and persists them atomically (`0600`) under `/appdata/secrets/` (`STATIC_DATA_DIR/secrets`) so sessions and encrypted integration credentials survive restarts without exposing keys in logs. A new secret is generated only when the file does not exist; if it exists but is unreadable or invalid (or cannot be written), startup fails instead of replacing it. Both variables also accept `SECRET_ENCRYPTION_KEY_FILE` / `AUTH_SECRET_FILE` (path to a file such as a Docker secret; the plain variable wins if both are set). Deployments started from an older `docker-compose.yml` that defaulted `SECRET_ENCRYPTION_KEY` to the public `0123456789abcdef…` value must set it to that value to keep reading stored integration secrets, then rotate.
 
 ### 2. Docker Compose
 
@@ -157,8 +157,8 @@ STATIC_DATA_DIR=./appdata DB_URL=./appdata/db/db.sqlite ASSETS_DIR=./assets ./ho
 | `DB_DRIVER` | `sqlite` | `sqlite` or `postgres` |
 | `DB_URL` | `/appdata/db/db.sqlite` | Database connection URL (or `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`) |
 | `ASSETS_DIR` | `assets` (`/app/assets` in Docker) | Path to static CSS/JS, icons, and 36 locale JSON files |
-| `SECRET_ENCRYPTION_KEY` | Auto-persisted (64 hex chars) | AES-256 encryption key for integration secrets |
-| `AUTH_SECRET` | Auto-persisted | Session &amp; CSRF signing secret |
+| `SECRET_ENCRYPTION_KEY` | Auto-persisted (64 hex chars) | AES-256 encryption key for integration secrets (or `SECRET_ENCRYPTION_KEY_FILE`) |
+| `AUTH_SECRET` | Auto-persisted | Session &amp; CSRF signing secret (or `AUTH_SECRET_FILE`) |
 | `AUTH_COOKIE_SECURE` | Auto (`true` on HTTPS) | Explicit override for session cookie `Secure` flag |
 | `AUTH_TRUSTED_PROXY_HEADER` | Unset | Reverse-proxy header name for pre-authenticated SSO username |
 | `AUTH_TRUSTED_PROXY_IPS` | Unset | Comma-separated proxy IPs/CIDRs allowed to send `AUTH_TRUSTED_PROXY_HEADER`; the header is ignored from any other peer (and entirely when unset) |

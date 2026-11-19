@@ -11,7 +11,7 @@ use chrono::Utc;
 use homarr_auth::{
     build_clear_session_cookie, build_session_cookie, cookie_secure, create_api_key,
     create_session, delete_session, hash_password, session_cookie_name, verify_password,
-    OptionalAuth, RequireAuth,
+    OptionalAuth, RequireAdmin,
 };
 use homarr_common::{HomarrError, HomarrResult};
 use homarr_db::repos::{api_keys, boards, groups, invites, settings, users};
@@ -264,7 +264,7 @@ pub async fn register(
 }
 
 pub async fn list_api_keys(
-    RequireAuth(session): RequireAuth,
+    RequireAdmin(session): RequireAdmin,
     State(state): State<AppState>,
 ) -> HomarrResult<Json<Value>> {
     let keys = api_keys::list_by_user(&state.db, &session.user_id).await?;
@@ -279,7 +279,7 @@ pub struct CreateApiKeyBody {
 }
 
 pub async fn create_user_api_key(
-    RequireAuth(session): RequireAuth,
+    RequireAdmin(session): RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<CreateApiKeyBody>,
 ) -> HomarrResult<(StatusCode, Json<Value>)> {
@@ -296,17 +296,11 @@ pub async fn create_user_api_key(
 }
 
 pub async fn delete_user_api_key(
-    RequireAuth(session): RequireAuth,
+    RequireAdmin(session): RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> HomarrResult<Json<Value>> {
     session.require_writable(state.demo_read_only_active())?;
-    let keys = api_keys::list_by_user(&state.db, &session.user_id).await?;
-    if !session.is_admin() && !keys.iter().any(|k| k.id == id) {
-        return Err(HomarrError::Forbidden(
-            "Cannot delete another user's API key".into(),
-        ));
-    }
     let deleted = api_keys::delete(&state.db, &id).await?;
     if !deleted {
         return Err(HomarrError::NotFound("API key not found".into()));

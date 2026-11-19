@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -37,30 +37,22 @@ async fn resolve_unblocked(
     Ok(Box::new(addrs.into_iter()))
 }
 
-#[derive(Debug, Clone)]
-pub struct HttpClientFactory {
+/// Clients that trust the uploaded certificates; rebuilt by [`HttpClientFactory::reload`].
+#[derive(Debug)]
+struct Clients {
     standard: Client,
     no_redirect: Client,
     guarded: Client,
-    ping: Client,
-    certs: CertificateManager,
 }
 
-impl HttpClientFactory {
-    pub fn new(certs: &CertificateManager) -> HomarrResult<Self> {
+impl Clients {
+    fn build(certs: &CertificateManager) -> HomarrResult<Self> {
         let extra_certs = certs.load_reqwest_certificates();
 
         let mut standard_builder = Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .user_agent(concat!("Homarr/", env!("CARGO_PKG_VERSION")));
-        for cert in &extra_certs {
-            standard_builder = standard_builder.add_root_certificate(cert.clone());
-        }
-        let standard = standard_builder
-            .build()
-            .map_err(|err| HomarrError::Internal(format!("Failed to build HTTP client: {err}")))?;
-
         let mut no_redirect_builder = Client::builder()
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(10))
@@ -73,15 +65,40 @@ impl HttpClientFactory {
             .dns_resolver(Arc::new(BlockedIpFilteringResolver))
             .user_agent(concat!("Homarr/", env!("CARGO_PKG_VERSION")));
         for cert in extra_certs {
+            standard_builder = standard_builder.add_root_certificate(cert.clone());
             no_redirect_builder = no_redirect_builder.add_root_certificate(cert.clone());
             guarded_builder = guarded_builder.add_root_certificate(cert);
         }
+
+        let standard = standard_builder
+            .build()
+            .map_err(|err| HomarrError::Internal(format!("Failed to build HTTP client: {err}")))?;
         let guarded = guarded_builder.build().map_err(|err| {
             HomarrError::Internal(format!("Failed to build guarded HTTP client: {err}"))
         })?;
         let no_redirect = no_redirect_builder.build().map_err(|err| {
             HomarrError::Internal(format!("Failed to build no-redirect HTTP client: {err}"))
         })?;
+        Ok(Self {
+            standard,
+            no_redirect,
+            guarded,
+        })
+    }
+}
+
+/// Cheap to clone: all clones share the same clients, so [`reload`](Self::reload) reaches
+/// every service holding a copy.
+#[derive(Debug, Clone)]
+pub struct HttpClientFactory {
+    clients: Arc<RwLock<Clients>>,
+    ping: Client,
+    certs: CertificateManager,
+}
+
+impl HttpClientFactory {
+    pub fn new(certs: &CertificateManager) -> HomarrResult<Self> {
+        let clients = Clients::build(certs)?;
 
         let ping = Client::builder()
             .timeout(Duration::from_secs(10))
@@ -92,25 +109,35 @@ impl HttpClientFactory {
             .map_err(|err| HomarrError::Internal(format!("Failed to build ping client: {err}")))?;
 
         Ok(Self {
-            standard,
-            no_redirect,
-            guarded,
+            clients: Arc::new(RwLock::new(clients)),
             ping,
             certs: certs.clone(),
         })
     }
 
-    pub fn standard(&self) -> &Client {
-        &self.standard
+    /// Rebuilds the clients from the certificate directory so uploaded or removed
+    /// certificates apply without a restart. In-flight requests keep their old client.
+    pub fn reload(&self) -> HomarrResult<()> {
+        let fresh = Clients::build(&self.certs)?;
+        *self.clients.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+        Ok(())
     }
 
-    pub fn no_redirect(&self) -> &Client {
-        &self.no_redirect
+    fn current(&self) -> RwLockReadGuard<'_, Clients> {
+        self.clients.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn standard(&self) -> Client {
+        self.current().standard.clone()
+    }
+
+    pub fn no_redirect(&self) -> Client {
+        self.current().no_redirect.clone()
     }
 
     /// Client for untrusted URLs: no redirects, blocked IPs filtered at connect time.
-    pub fn guarded(&self) -> &Client {
-        &self.guarded
+    pub fn guarded(&self) -> Client {
+        self.current().guarded.clone()
     }
 
     pub fn ping(&self) -> &Client {
@@ -142,9 +169,9 @@ impl HttpClientFactory {
             }
 
             let client = if is_trusted {
-                &self.no_redirect
+                self.no_redirect()
             } else {
-                &self.guarded
+                self.guarded()
             };
             let mut req = client.get(current_url.clone());
             if let Some(ref headers) = current_headers {
@@ -252,4 +279,18 @@ pub async fn read_bounded_bytes(response: Response, max_bytes: usize) -> HomarrR
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_is_shared_by_clones() {
+        let certs = CertificateManager::new("./test-certs-nonexistent".into());
+        let factory = HttpClientFactory::new(&certs).unwrap();
+        let clone = factory.clone();
+        clone.reload().unwrap();
+        assert!(Arc::ptr_eq(&factory.clients, &clone.clients));
+    }
 }

@@ -1,12 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
+    Engine,
+};
 use homarr_common::{HomarrError, HomarrResult};
 use homarr_definitions::integration::{
     get_integration_def, IntegrationHttpAuthDefinition, IntegrationHttpBodyAuth,
     IntegrationHttpStandardAuth,
 };
 use homarr_definitions::IntegrationKind;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use serde_json::Value;
 
 use crate::types::IntegrationContext;
 
@@ -306,4 +311,235 @@ fn resolve_adapter_http_auth(ctx: &IntegrationContext) -> HomarrResult<ResolvedH
         body: None,
         redact_values,
     })
+}
+
+const REDACTED: &str = "[REDACTED]";
+/// Shorter credentials can be ordinary words in response data, so they are only redacted on exact match.
+const MIN_EMBEDDED_SECRET_LEN: usize = 12;
+/// Characters JavaScript's `encodeURIComponent` leaves unescaped.
+const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
+
+/// Removes integration secrets from upstream responses (port of `redactResponseSecrets`).
+#[derive(Debug, Default)]
+pub struct SecretRedactor {
+    /// Encoded secrets that replace a whole string (or scalar) value.
+    exact: HashSet<String>,
+    /// Encoded secrets replaced wherever they occur inside a string, longest first.
+    embedded: Vec<String>,
+}
+
+impl SecretRedactor {
+    pub fn new(ctx: &IntegrationContext, auth: &ResolvedHttpAuth) -> Self {
+        let mut redactor = Self::default();
+        for (kind, value) in &ctx.secrets {
+            redactor.add(
+                value,
+                kind != "username" && value.len() >= MIN_EMBEDDED_SECRET_LEN,
+            );
+        }
+        if let (Some(user), Some(pass)) = (ctx.secret("username"), ctx.secret("password")) {
+            redactor.add_derived(&format!("{user}:{pass}"));
+        }
+        for value in &auth.redact_values {
+            redactor.add_derived(value);
+        }
+        for value in auth.headers.values() {
+            redactor.add_derived(value);
+            // "Bearer x" / "Basic x" / "Token x": the credential after the scheme.
+            if let Some((_, credential)) = value.split_once(' ') {
+                redactor.add_derived(credential);
+            }
+        }
+        for (name, value) in &auth.query {
+            redactor.add_derived(value);
+            let pair = format!(
+                "{}={}",
+                utf8_percent_encode(name, URI_COMPONENT),
+                utf8_percent_encode(value, URI_COMPONENT)
+            );
+            redactor.add(&pair, true);
+        }
+        if let Some(
+            IntegrationHttpBodyAuth::JsonField { value, .. }
+            | IntegrationHttpBodyAuth::JsonArrayPrefix { value, .. },
+        ) = &auth.body
+        {
+            redactor.add_derived(value);
+        }
+        redactor
+            .embedded
+            .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        redactor.embedded.dedup();
+        redactor
+    }
+
+    /// Redactor for arbitrary secret values (e.g. custom widget HTTP source secrets or the
+    /// header values built from them).
+    pub fn from_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut redactor = Self::default();
+        for value in values {
+            redactor.add_derived(value);
+            if let Some((_, credential)) = value.split_once(' ') {
+                redactor.add_derived(credential);
+            }
+        }
+        redactor
+            .embedded
+            .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        redactor.embedded.dedup();
+        redactor
+    }
+
+    fn add_derived(&mut self, value: &str) {
+        self.add(value, value.len() >= MIN_EMBEDDED_SECRET_LEN);
+    }
+
+    fn add(&mut self, value: &str, embedded: bool) {
+        if value.is_empty() {
+            return;
+        }
+        let json = serde_json::to_string(value).unwrap_or_default();
+        let b64 = B64.encode(value);
+        let variants = [
+            value.to_string(),
+            json.get(1..json.len().saturating_sub(1))
+                .unwrap_or(value)
+                .to_string(),
+            utf8_percent_encode(value, URI_COMPONENT).to_string(),
+            b64.trim_end_matches('=').to_string(),
+            URL_SAFE_NO_PAD.encode(value),
+            b64,
+        ];
+        for variant in variants {
+            if embedded {
+                self.embedded.push(variant.clone());
+            }
+            self.exact.insert(variant);
+        }
+    }
+
+    pub fn redact_str(&self, value: &str) -> String {
+        if self.exact.contains(value) {
+            return REDACTED.to_string();
+        }
+        let mut out = value.to_string();
+        for secret in &self.embedded {
+            if out.contains(secret.as_str()) {
+                out = out.replace(secret.as_str(), REDACTED);
+            }
+        }
+        out
+    }
+
+    pub fn redact_value(&self, value: Value) -> Value {
+        match value {
+            Value::String(s) => Value::String(self.redact_str(&s)),
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(|v| self.redact_value(v)).collect())
+            }
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| (self.redact_str(&k), self.redact_value(v)))
+                    .collect(),
+            ),
+            scalar => {
+                if self.exact.contains(&scalar.to_string()) {
+                    Value::String(REDACTED.to_string())
+                } else {
+                    scalar
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    fn redactor(secrets: &[(&str, &str)], auth: ResolvedHttpAuth) -> SecretRedactor {
+        let ctx = IntegrationContext {
+            id: "id".to_string(),
+            name: "name".to_string(),
+            url: "http://localhost".to_string(),
+            external_url: None,
+            kind: IntegrationKind::Sonarr,
+            secrets: secrets
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        };
+        SecretRedactor::new(&ctx, &auth)
+    }
+
+    #[test]
+    fn redacts_nested_json() {
+        let r = redactor(&[("apiKey", KEY)], ResolvedHttpAuth::default());
+        let body = json!({
+            "apiKey": KEY,
+            "nested": [{ "url": format!("http://x/?apikey={KEY}") }, 5],
+            KEY: "key-named",
+        });
+        assert_eq!(
+            r.redact_value(body),
+            json!({
+                "apiKey": "[REDACTED]",
+                "nested": [{ "url": "http://x/?apikey=[REDACTED]" }, 5],
+                "[REDACTED]": "key-named",
+            })
+        );
+    }
+
+    #[test]
+    fn redacts_plain_text_and_derived_values() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer tok-0123456789".to_string(),
+        );
+        let mut query = HashMap::new();
+        query.insert("token".to_string(), "abc".to_string());
+        let r = redactor(
+            &[],
+            ResolvedHttpAuth {
+                headers,
+                query,
+                ..Default::default()
+            },
+        );
+        let text = format!(
+            "auth tok-0123456789 b64 {} q ?token=abc",
+            B64.encode("tok-0123456789")
+        );
+        assert_eq!(
+            r.redact_str(&text),
+            "auth [REDACTED] b64 [REDACTED] q ?[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn short_values_only_redacted_on_exact_match() {
+        let r = redactor(
+            &[("username", "admin-user-name"), ("password", "pw")],
+            ResolvedHttpAuth::default(),
+        );
+        assert_eq!(
+            r.redact_value(json!(["a pw b", "pw", "hello admin-user-name"])),
+            json!(["a pw b", "[REDACTED]", "hello admin-user-name"])
+        );
+        assert_eq!(r.redact_str("plain text"), "plain text");
+    }
 }

@@ -59,12 +59,12 @@ impl KubernetesService {
                     .add_root_certificate(cert)
                     .timeout(std::time::Duration::from_secs(10))
                     .build()
-                    .unwrap_or_else(|_| self.http.standard().clone())
+                    .unwrap_or_else(|_| self.http.standard())
             } else {
-                self.http.standard().clone()
+                self.http.standard()
             }
         } else {
-            self.http.standard().clone()
+            self.http.standard()
         };
 
         let resp = client

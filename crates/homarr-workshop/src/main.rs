@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use axum::{
     extract::{Path as AxumPath, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -98,6 +98,24 @@ async fn init_workshop_db(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
             "updated_at" INTEGER NOT NULL
         );
         "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // Older databases predate listing ownership; add the column in place.
+    let has_author_id: i64 = sqlx::query(
+        r#"SELECT count(*) AS cnt FROM pragma_table_info('workshop_listings') WHERE name = 'author_id'"#,
+    )
+    .fetch_one(&pool)
+    .await?
+    .try_get("cnt")?;
+    if has_author_id == 0 {
+        sqlx::raw_sql(r#"ALTER TABLE "workshop_listings" ADD COLUMN "author_id" TEXT"#)
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::raw_sql(
+        r#"CREATE INDEX IF NOT EXISTS "workshop_users_token_idx" ON "workshop_users" ("token")"#,
     )
     .execute(&pool)
     .await?;
@@ -223,15 +241,47 @@ struct CreateListingBody {
     pub name: String,
     pub description: Option<String>,
     pub icon_url: Option<String>,
-    pub author: Option<String>,
     pub version: Option<String>,
     pub definition: Value,
 }
 
+struct WorkshopUser {
+    id: String,
+    username: String,
+}
+
+/// Resolves `Authorization: Bearer <token>` to the account that login/register issued it to.
+/// The token is matched by an indexed DB lookup, not compared in Rust code.
+async fn authenticate(pool: &SqlitePool, headers: &HeaderMap) -> HomarrResult<WorkshopUser> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| HomarrError::Unauthorized("Missing bearer token".into()))?;
+    let row = sqlx::query(r#"SELECT "id", "username" FROM "workshop_users" WHERE "token" = ?"#)
+        .bind(token)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| HomarrError::Database(e.to_string()))?
+        .ok_or_else(|| HomarrError::Unauthorized("Invalid token".into()))?;
+    Ok(WorkshopUser {
+        id: row
+            .try_get("id")
+            .map_err(|e| HomarrError::Database(e.to_string()))?,
+        username: row
+            .try_get("username")
+            .map_err(|e| HomarrError::Database(e.to_string()))?,
+    })
+}
+
 async fn create_listing(
     State(state): State<WorkshopState>,
+    headers: HeaderMap,
     Json(body): Json<CreateListingBody>,
 ) -> HomarrResult<(StatusCode, Json<ListingRecord>)> {
+    let user = authenticate(&state.pool, &headers).await?;
     validate_custom_widget_definition(&body.definition)?;
     let id = create_id();
     let now = Utc::now().timestamp();
@@ -246,15 +296,16 @@ async fn create_listing(
         .map_err(|e| HomarrError::BadRequest(e.to_string()))?;
 
     sqlx::query(
-        r#"INSERT INTO "workshop_listings" ("id", "slug", "name", "description", "icon_url", "author", "version", "downloads", "definition_json", "created_at", "updated_at")
-           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)"#,
+        r#"INSERT INTO "workshop_listings" ("id", "slug", "name", "description", "icon_url", "author", "author_id", "version", "downloads", "definition_json", "created_at", "updated_at")
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)"#,
     )
     .bind(&id)
     .bind(&slug)
     .bind(body.name.trim())
     .bind(&body.description)
     .bind(&body.icon_url)
-    .bind(&body.author)
+    .bind(&user.username)
+    .bind(&user.id)
     .bind(&version)
     .bind(&def_json)
     .bind(now)
@@ -271,7 +322,7 @@ async fn create_listing(
             name: body.name.trim().to_string(),
             description: body.description,
             icon_url: body.icon_url,
-            author: body.author,
+            author: Some(user.username),
             version,
             downloads: 0,
             definition: body.definition,
@@ -364,17 +415,37 @@ async fn download_listing(
 
 async fn delete_listing(
     State(state): State<WorkshopState>,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> HomarrResult<Json<Value>> {
-    let res = sqlx::query(r#"DELETE FROM "workshop_listings" WHERE "id" = ? OR "slug" = ?"#)
-        .bind(&id)
-        .bind(&id)
+    let user = authenticate(&state.pool, &headers).await?;
+    let row = sqlx::query(
+        r#"SELECT "id", "author_id" FROM "workshop_listings" WHERE "id" = ? OR "slug" = ?"#,
+    )
+    .bind(&id)
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| HomarrError::Database(e.to_string()))?
+    .ok_or_else(|| HomarrError::NotFound("Listing not found".into()))?;
+    let real_id: String = row
+        .try_get("id")
+        .map_err(|e| HomarrError::Database(e.to_string()))?;
+    let author_id: Option<String> = row
+        .try_get("author_id")
+        .map_err(|e| HomarrError::Database(e.to_string()))?;
+    // No admin role exists in this service, so only the owning account may delete.
+    if author_id.as_deref() != Some(user.id.as_str()) {
+        return Err(HomarrError::Forbidden(
+            "Only the listing author can delete it".into(),
+        ));
+    }
+
+    sqlx::query(r#"DELETE FROM "workshop_listings" WHERE "id" = ?"#)
+        .bind(&real_id)
         .execute(&state.pool)
         .await
         .map_err(|e| HomarrError::Database(e.to_string()))?;
-    if res.rows_affected() == 0 {
-        return Err(HomarrError::NotFound("Listing not found".into()));
-    }
     Ok(Json(json!({ "deleted": true })))
 }
 
@@ -503,6 +574,129 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    async fn register(app: &Router, username: &str) -> String {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "username": username, "password": "secret-pw" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        v["token"].as_str().unwrap().to_string()
+    }
+
+    fn create_request(token: Option<&str>) -> Request<Body> {
+        let mut req =
+            Request::post("/api/listings").header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        req.body(Body::from(
+            json!({
+                "name": "Owned Tile",
+                "author": "Homarr Team",
+                "definition": {
+                    "schema": "homarr-custom-widget-v2",
+                    "name": "Owned Tile",
+                    "template": "<div>{{value}}</div>",
+                    "sources": [],
+                    "requests": []
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap()
+    }
+
+    fn delete_request(id: &str, token: &str) -> Request<Body> {
+        Request::delete(format!("/api/listings/{id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn listing_writes_require_token_and_ownership() {
+        let pool = init_workshop_db("sqlite::memory:").await.unwrap();
+        let app = workshop_router(WorkshopState { pool }, Path::new("/nonexistent"));
+
+        let anon = app.clone().oneshot(create_request(None)).await.unwrap();
+        assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+        let bogus = app
+            .clone()
+            .oneshot(create_request(Some("not-a-real-token")))
+            .await
+            .unwrap();
+        assert_eq!(bogus.status(), StatusCode::UNAUTHORIZED);
+
+        let alice = register(&app, "alice").await;
+        let mallory = register(&app, "mallory").await;
+
+        let created = app
+            .clone()
+            .oneshot(create_request(Some(&alice)))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let rec: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        // Client-supplied author is ignored.
+        assert_eq!(rec["author"], "alice");
+        let id = rec["id"].as_str().unwrap().to_string();
+
+        let anon_delete = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/listings/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anon_delete.status(), StatusCode::UNAUTHORIZED);
+
+        let foreign = app
+            .clone()
+            .oneshot(delete_request(&id, &mallory))
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+
+        // Seeded listing has no owner account, so nobody can delete it.
+        let seed = app
+            .clone()
+            .oneshot(delete_request("homarr-welcome-card", &mallory))
+            .await
+            .unwrap();
+        assert_eq!(seed.status(), StatusCode::FORBIDDEN);
+
+        let own = app
+            .clone()
+            .oneshot(delete_request(&id, &alice))
+            .await
+            .unwrap();
+        assert_eq!(own.status(), StatusCode::OK);
+
+        let gone = app
+            .oneshot(
+                Request::get(format!("/api/listings/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn workshop_health_create_validate_and_download() {
         let pool = init_workshop_db("sqlite::memory:").await.unwrap();
@@ -515,12 +709,15 @@ mod tests {
             .unwrap();
         assert_eq!(h.status(), StatusCode::OK);
 
+        let token = register(&app, "alice").await;
+
         // Reject unsafe Custom Widget v2 definition containing <script>
         let bad = app
             .clone()
             .oneshot(
                 Request::post("/api/listings")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::from(
                         json!({
                             "name": "Evil",
@@ -544,6 +741,7 @@ mod tests {
             .oneshot(
                 Request::post("/api/listings")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::from(
                         json!({
                             "name": "Metrics Tile",

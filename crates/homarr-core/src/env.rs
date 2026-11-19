@@ -87,48 +87,70 @@ fn is_non_empty(value: &str) -> bool {
 }
 
 /// Loads a persisted secret from `<dir>/secrets/<file_name>`, generating and persisting a new one
-/// atomically (mode 0600 on unix) when absent, empty, or invalid. Falls back to an ephemeral secret
-/// only if persisting fails. The secret value is never logged.
+/// atomically (mode 0600 on unix) only when the file does not exist. An unreadable or invalid
+/// existing file, or a failed write, is an error: silently replacing the secret would make data
+/// protected by the old one unreadable. The secret value is never logged.
 fn load_or_create_secret(
     dir: &Path,
     file_name: &str,
     label: &str,
     validate: fn(&str) -> bool,
-) -> String {
+) -> HomarrResult<String> {
     let path = dir.join("secrets").join(file_name);
     match std::fs::read_to_string(&path) {
         Ok(existing) => {
             let trimmed = existing.trim();
             if validate(trimmed) {
-                return trimmed.to_string();
+                return Ok(trimmed.to_string());
             }
+            Err(HomarrError::Internal(format!(
+                "{label} is not set and the persisted value at {} is empty or invalid. Refusing to replace it because data protected by the previous value would become unreadable. Set {label} (or {label}_FILE) to the correct value, or remove the file to generate a new one.",
+                path.display()
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let generated = generate_secure_random_token(32);
+            write_secret_file(&path, &generated).map_err(|e| {
+                HomarrError::Internal(format!(
+                    "{label} is not set and a generated value could not be persisted at {} ({e}). Make the directory writable or set {label} (or {label}_FILE) explicitly.",
+                    path.display()
+                ))
+            })?;
             eprintln!(
-                "Warning: {label} at {} was empty or invalid; regenerating a new persisted value.",
+                "Warning: {label} is not set; generated a value and persisted it at {}. Back up this file or set {label} explicitly.",
                 path.display()
             );
+            Ok(generated)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            eprintln!(
-                "Warning: {label} is not set and {} could not be read ({e}); using an ephemeral value for this process.",
-                path.display()
-            );
-            return generate_secure_random_token(32);
-        }
+        Err(e) => Err(HomarrError::Internal(format!(
+            "{label} is not set and the persisted value at {} could not be read ({e}). Fix the file permissions or set {label} (or {label}_FILE) explicitly.",
+            path.display()
+        ))),
     }
+}
 
-    let generated = generate_secure_random_token(32);
-    match write_secret_file(&path, &generated) {
-        Ok(()) => eprintln!(
-            "Warning: {label} is not set; generated a value and persisted it at {}. Set {label} explicitly in production.",
-            path.display()
-        ),
-        Err(e) => eprintln!(
-            "Warning: {label} is not set and could not be persisted at {} ({e}); using an ephemeral value for this process.",
-            path.display()
-        ),
+/// Reads `key` from the environment, falling back to the trimmed contents of the file named by
+/// `<key>_FILE` (Docker secrets). The plain variable takes precedence.
+fn secret_env(key: &str) -> HomarrResult<Option<String>> {
+    if let Some(value) = non_empty_env(key) {
+        return Ok(Some(value));
     }
-    generated
+    let file_key = format!("{key}_FILE");
+    let Some(file_path) = non_empty_env(&file_key) else {
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(&file_path).map_err(|e| {
+        HomarrError::Internal(format!(
+            "{file_key} is set to {file_path} but the file could not be read ({e})"
+        ))
+    })?;
+    let value = content.trim();
+    if value.is_empty() {
+        return Err(HomarrError::Internal(format!(
+            "{file_key} is set to {file_path} but the file is empty"
+        )));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn write_secret_file(path: &Path, value: &str) -> std::io::Result<()> {
@@ -233,7 +255,7 @@ impl AppConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("static-data"));
 
-        let secret_encryption_key = match non_empty_env("SECRET_ENCRYPTION_KEY") {
+        let secret_encryption_key = match secret_env("SECRET_ENCRYPTION_KEY")? {
             Some(key) => {
                 if !is_valid_hex_64(&key) {
                     let candidate = generate_secure_random_token(32);
@@ -248,12 +270,15 @@ impl AppConfig {
                 "secret_encryption_key",
                 "SECRET_ENCRYPTION_KEY",
                 is_valid_hex_64,
-            ),
+            )?,
         };
 
-        let auth_secret = non_empty_env("AUTH_SECRET").unwrap_or_else(|| {
-            load_or_create_secret(&static_data_dir, "auth_secret", "AUTH_SECRET", is_non_empty)
-        });
+        let auth_secret = match secret_env("AUTH_SECRET")? {
+            Some(secret) => secret,
+            None => {
+                load_or_create_secret(&static_data_dir, "auth_secret", "AUTH_SECRET", is_non_empty)?
+            }
+        };
 
         let host = non_empty_env("HOST").unwrap_or_else(|| "0.0.0.0".to_string());
         let port = non_empty_env("PORT")
@@ -429,15 +454,28 @@ mod tests {
         assert_eq!(cfg.redis_url(), "redis://127.0.0.1:6379/0");
     }
 
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "homarr-{name}-{}-{}",
+            std::process::id(),
+            generate_secure_random_token(4)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     #[test]
     fn generated_secret_is_persisted_and_reloaded() {
-        let dir = std::env::temp_dir().join(format!("homarr-secret-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let first = load_or_create_secret(&dir, "k", "TEST", is_valid_hex_64);
+        let dir = unique_temp_dir("secret-test");
+        let first = load_or_create_secret(&dir, "k", "TEST", is_valid_hex_64).unwrap();
         assert_eq!(first.len(), 64);
         assert_eq!(
+            std::fs::read_to_string(dir.join("secrets/k")).unwrap(),
+            first
+        );
+        assert_eq!(
             first,
-            load_or_create_secret(&dir, "k", "TEST", is_valid_hex_64)
+            load_or_create_secret(&dir, "k", "TEST", is_valid_hex_64).unwrap()
         );
         #[cfg(unix)]
         {
@@ -452,32 +490,37 @@ mod tests {
     }
 
     #[test]
-    fn repairs_empty_or_invalid_persisted_secret() {
-        let dir = std::env::temp_dir().join(format!("homarr-secret-repair-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn invalid_persisted_secret_is_an_error_and_left_untouched() {
+        let dir = unique_temp_dir("secret-invalid");
         std::fs::create_dir_all(dir.join("secrets")).unwrap();
         let path = dir.join("secrets/secret_encryption_key");
 
-        // 0-byte leftover file
-        std::fs::write(&path, "").unwrap();
-        let repaired =
-            load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64);
-        assert!(is_valid_hex_64(&repaired));
-        assert_eq!(
-            repaired,
-            load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64)
-        );
+        for content in ["", "not-a-valid-hex-key"] {
+            std::fs::write(&path, content).unwrap();
+            let result =
+                load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64);
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
 
-        // Non-hex corrupted file
-        std::fs::write(&path, "not-a-valid-hex-key").unwrap();
-        let repaired2 =
-            load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64);
-        assert!(is_valid_hex_64(&repaired2));
-        assert_ne!(repaired2, "not-a-valid-hex-key");
-        assert_eq!(
-            repaired2,
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_valid_persisted_secret_is_reused() {
+        let dir = unique_temp_dir("secret-existing");
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        let key = "ab".repeat(32);
+        std::fs::write(
+            dir.join("secrets/secret_encryption_key"),
+            format!("{key}\n"),
+        )
+        .unwrap();
+
+        let loaded =
             load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64)
-        );
+                .unwrap();
+        assert_eq!(loaded, key);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

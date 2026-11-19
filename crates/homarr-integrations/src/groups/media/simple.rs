@@ -123,7 +123,7 @@ pub async fn audiobookshelf_stats(
 ) -> HomarrResult<AudiobookshelfDashboardData> {
     let key = ctx.require_secret("apiKey")?;
     let auth = format!("Bearer {key}");
-    let client = rt.http.standard();
+    let client = &rt.http.standard();
     let libraries_fut = async {
         let libs: AudiobookshelfLibrariesResponse = send_json(
             ctx,

@@ -7,7 +7,8 @@ use homarr_auth::{can_view_board, check_board_permission, AuthSession, OptionalA
 use homarr_common::{create_id, HomarrError, HomarrResult};
 use homarr_db::{
     models::{
-        FullBoard, GroupPermissionEntry, ItemLayoutRecord, LayoutRecord, UserPermissionEntry,
+        FullBoard, GroupPermissionEntry, ItemLayoutRecord, ItemRecord, LayoutRecord,
+        UserPermissionEntry,
     },
     repos::{
         boards::{
@@ -27,6 +28,44 @@ use serde_json::{json, Value};
 
 use super::board_content::{validate_board_content, validate_item_integrations};
 use crate::state::AppState;
+
+/// Custom widgets call integrations without the viewer's session when the board renders, so
+/// only admins may add one or change its kind, options or integrations. Moving, resizing and
+/// removing stay with the regular board permission. `submitted` must already be sanitized.
+/// Stored options may predate option sanitizing; compare them in the same normalized form.
+fn old_options(old: &ItemRecord) -> serde_json::Value {
+    WidgetKind::from_str_opt(&old.kind)
+        .map(|kind| sanitize_widget_options(kind, &old.options))
+        .unwrap_or_else(|| old.options.clone())
+}
+
+fn ensure_custom_widget_changes_allowed(
+    session: &AuthSession,
+    submitted: &[SaveBoardItemInput],
+    stored: &[ItemRecord],
+) -> HomarrResult<()> {
+    if session.is_admin() {
+        return Ok(());
+    }
+    let custom = WidgetKind::CustomApi.as_str();
+    for item in submitted {
+        let forbidden = match stored.iter().find(|s| s.id == item.id) {
+            None => item.kind == custom,
+            Some(old) => {
+                (old.kind == custom || item.kind == custom)
+                    && (old.kind != item.kind
+                        || old_options(old) != item.options
+                        || old.integration_ids != item.integration_ids)
+            }
+        };
+        if forbidden {
+            return Err(HomarrError::Forbidden(
+                "Only administrators can add or configure Custom Widgets".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn to_section_inputs(full: &FullBoard) -> Vec<SaveBoardSectionInput> {
     full.sections
@@ -176,14 +215,46 @@ pub async fn update_board(
     let board = boards::get_by_id(&state.db, &id)
         .await?
         .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
-    check_board_permission(&state.db, Some(&session), &board, BoardPermission::Modify).await?;
+    // Renaming and changing visibility need full access, like the original.
+    let required = if body.name.is_some() || body.is_public.is_some() {
+        BoardPermission::Full
+    } else {
+        BoardPermission::Modify
+    };
+    check_board_permission(&state.db, Some(&session), &board, required).await?;
 
-    if let Some(ref name) = body.name {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
+    let new_name = match body.name.as_deref().map(str::trim) {
+        Some("") => {
             return Err(HomarrError::BadRequest("Board name cannot be empty".into()));
         }
-        boards::rename_board(&state.db, &id, trimmed).await?;
+        Some(trimmed) => {
+            let lower = trimmed.to_lowercase();
+            let taken = boards::list_all(&state.db)
+                .await?
+                .iter()
+                .any(|b| b.id != id && b.name.to_lowercase() == lower);
+            if taken {
+                return Err(HomarrError::Conflict(
+                    "Board with similar name already exists".into(),
+                ));
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    if body.is_public == Some(false) {
+        let board_settings = settings::get_setting(&state.db, "board").await?;
+        let is_home = ["homeBoardId", "mobileHomeBoardId"]
+            .iter()
+            .any(|k| board_settings.get(*k).and_then(Value::as_str) == Some(id.as_str()));
+        if is_home {
+            return Err(HomarrError::BadRequest(
+                "Cannot make home board private".into(),
+            ));
+        }
+    }
+    if let Some(name) = new_name {
+        boards::rename_board(&state.db, &id, name).await?;
     }
     if let Some(is_public) = body.is_public {
         boards::set_visibility(&state.db, &id, is_public).await?;
@@ -238,6 +309,7 @@ pub async fn save_board_layout(
             item.options = sanitize_widget_options(kind, &item.options);
         }
     }
+    ensure_custom_widget_changes_allowed(&session, &body.items, &current.items)?;
     let updated = boards::save_board_content(&state.db, &id, &body.sections, &body.items).await?;
     let _ = state
         .redis
@@ -279,6 +351,7 @@ pub async fn create_board_item(
     if let Some(kind) = WidgetKind::from_str_opt(&item.kind) {
         item.options = sanitize_widget_options(kind, &item.options);
     }
+    ensure_custom_widget_changes_allowed(&session, std::slice::from_ref(&item), &[])?;
     boards::create_board_item(&state.db, &id, &item).await?;
     let updated = boards::get_full_board_by_id(&state.db, &id)
         .await?
@@ -373,6 +446,7 @@ pub async fn update_board_item(
         let items_in = to_item_inputs(&full);
         validate_board_content(&full.layouts, &sections_in, &items_in)?;
         validate_item_integrations(&state.db, &session, &items_in, &existing_items).await?;
+        ensure_custom_widget_changes_allowed(&session, &items_in, &existing_items)?;
         full = boards::save_board_content(&state.db, &board_id, &sections_in, &items_in).await?;
     }
     Ok(Json(full))
@@ -607,6 +681,7 @@ pub async fn duplicate_board(
     .await?;
     let source_items = to_item_inputs(&source);
     validate_item_integrations(&state.db, &session, &source_items, &[]).await?;
+    ensure_custom_widget_changes_allowed(&session, &source_items, &[])?;
     let dup = boards::duplicate_board(&state.db, &id, new_name, Some(&session.user_id)).await?;
     Ok((StatusCode::CREATED, Json(dup)))
 }
@@ -876,6 +951,7 @@ pub async fn import_board(
 
     validate_board_content(&layout_records, &remapped_sections, &remapped_items)?;
     validate_item_integrations(&state.db, &session, &remapped_items, &[]).await?;
+    ensure_custom_widget_changes_allowed(&session, &remapped_items, &[])?;
 
     let created = boards::create_board_with_defaults(
         &state.db,

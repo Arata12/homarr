@@ -66,11 +66,17 @@ services:
       REDIS_IS_EXTERNAL: "true"
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
-      AUTH_SECRET: ${AUTH_SECRET:-fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210}
+      # Leave SECRET_ENCRYPTION_KEY / AUTH_SECRET unset (empty counts as unset) to let Homarr
+      # generate and persist them under /appdata/secrets, or set them (or *_FILE) yourself.
+      # UPGRADE NOTE: older versions of this file defaulted SECRET_ENCRYPTION_KEY to the public
+      # value 0123456789abcdef repeated 4 times. If your deployment started with that default, set
+      # SECRET_ENCRYPTION_KEY to that old value to keep reading stored integration secrets, then
+      # rotate to a new private key and re-enter the integration secrets.
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:-}
+      AUTH_SECRET: ${AUTH_SECRET:-}
       DEMO_MODE: ${DEMO_MODE:-false}
       DEMO_READ_ONLY: ${DEMO_READ_ONLY:-true}
-      UNSAFE_ENABLE_MOCK_INTEGRATION: ${UNSAFE_ENABLE_MOCK_INTEGRATION:-true}
+      UNSAFE_ENABLE_MOCK_INTEGRATION: ${UNSAFE_ENABLE_MOCK_INTEGRATION:-false}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       ASSETS_DIR: /app/assets
       WORKSHOP_API_URL: ${WORKSHOP_API_URL:-http://workshop:8090}
@@ -103,7 +109,8 @@ services:
     environment:
       DB_DRIVER: ${DB_DRIVER:-sqlite}
       DB_URL: ${DB_URL:-/appdata/db/db.sqlite}
-      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      # Empty = use the key persisted by the homarr service in the shared /appdata volume.
+      SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:-}
     entrypoint: ["/usr/local/bin/homarr"]
 
 volumes:

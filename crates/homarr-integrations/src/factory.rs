@@ -42,7 +42,7 @@ use crate::capabilities::vpn::VpnSummary;
 use crate::clients::build_request_url;
 use crate::error::unsupported;
 use crate::groups::{group_for_kind, IntegrationGroup};
-use crate::http_auth::{resolve_declared_http_auth, ResolvedHttpAuth};
+use crate::http_auth::{resolve_declared_http_auth, ResolvedHttpAuth, SecretRedactor};
 use crate::runtime::{ImageProxyProvider, IntegrationRuntime};
 use crate::types::{
     CalendarEvent, DnsHoleSummary, DownloadClientQueue, HealthMonitoringInfo, HttpProxyResponse,
@@ -149,6 +149,8 @@ impl IntegrationRegistry {
         }
 
         let auth = self.resolve_http_auth(ctx)?;
+        // Upstream responses (e.g. Sonarr's /config/host) can echo the integration's credentials.
+        let redactor = SecretRedactor::new(ctx, &auth);
         let mut query = auth.query;
         if let Some(eq) = extra_query {
             for (k, v) in eq {
@@ -179,11 +181,12 @@ impl IntegrationRegistry {
         let mut resp_headers = HashMap::new();
         for (k, v) in resp.headers() {
             if let Ok(val_str) = v.to_str() {
-                resp_headers.insert(k.as_str().to_string(), val_str.to_string());
+                resp_headers.insert(k.as_str().to_string(), redactor.redact_str(val_str));
             }
         }
         let text = resp.text().await.unwrap_or_default();
         let body_val = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+        let body_val = redactor.redact_value(body_val);
 
         Ok(HttpProxyResponse {
             status,

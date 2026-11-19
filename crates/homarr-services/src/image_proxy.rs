@@ -169,6 +169,15 @@ impl ImageProxyService {
             )));
         }
 
+        // Only images may be proxied; anything else (HTML, JS, ...) could become stored XSS.
+        if let Some(ct) = content_type.as_deref() {
+            if !is_image_content_type(ct) {
+                return Err(HomarrError::Upstream(format!(
+                    "Image upstream returned non-image content-type '{ct}'"
+                )));
+            }
+        }
+
         Ok(ImageProxyResult::Bytes {
             content_type: content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
             data: bytes,
@@ -209,6 +218,14 @@ impl ImageProxyService {
     }
 }
 
+/// True for `image/*` media types (parameters and case ignored).
+pub fn is_image_content_type(content_type: &str) -> bool {
+    content_type
+        .trim_start()
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+}
+
 #[async_trait::async_trait]
 impl homarr_integrations::runtime::ImageProxyProvider for ImageProxyService {
     async fn proxy_image(
@@ -219,5 +236,21 @@ impl homarr_integrations::runtime::ImageProxyProvider for ImageProxyService {
     ) -> HomarrResult<String> {
         self.forward_trusted_image(url, headers, trusted_origin)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_image_content_type;
+
+    #[test]
+    fn image_content_type_filter() {
+        assert!(is_image_content_type("image/png"));
+        assert!(is_image_content_type("IMAGE/JPEG; q=1"));
+        assert!(is_image_content_type("image/svg+xml"));
+        assert!(!is_image_content_type("text/html"));
+        assert!(!is_image_content_type("application/octet-stream"));
+        assert!(!is_image_content_type("image"));
+        assert!(!is_image_content_type(""));
     }
 }
