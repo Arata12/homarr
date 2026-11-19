@@ -4,6 +4,8 @@
 //! obtained from `POST /api/auth`. The public `/api/info/login` endpoint answers 404 on v5 and 200 on v6 without
 //! authentication, which is how the version is detected (falling back to v6 when unreachable).
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use homarr_common::{HomarrError, HomarrResult};
 use serde::Deserialize;
@@ -12,6 +14,7 @@ use serde_json::{json, Value};
 use super::http;
 use super::DnsHole;
 use crate::capabilities::dns_hole::{DnsHoleStatus, DnsHoleSummary};
+use crate::http_auth::ResolvedHttpAuth;
 use crate::runtime::IntegrationRuntime;
 use crate::types::IntegrationContext;
 
@@ -129,17 +132,17 @@ fn map_v6_summary(stats: StatsSummary, blocking: &DnsBlocking) -> DnsHoleSummary
     }
 }
 
+/// `POST /api/auth`; without a saved API key the empty password is sent, which only a Pi-hole without a
+/// password accepts (`valid: true`).
 async fn v6_login(
     rt: &IntegrationRuntime,
     ctx: &IntegrationContext,
 ) -> HomarrResult<Option<String>> {
-    let Some(api_key) = ctx.secret("apiKey") else {
-        return Ok(None);
-    };
+    let password = ctx.secret("apiKey").unwrap_or_default();
     let url = http::url(ctx, "/api/auth", &[])?;
     let value = http::send_json(
         ctx,
-        http::post(rt, url).json(&json!({ "password": api_key })),
+        http::post(rt, url).json(&json!({ "password": password })),
     )
     .await?;
     let response: SessionResponse = http::from_value(ctx, "the Pi-hole session", value)?;
@@ -199,6 +202,43 @@ async fn v6_json(
 ) -> HomarrResult<Value> {
     let resp = v6_request(rt, ctx, reqwest::Method::GET, path, None).await?;
     http::read_json(ctx, resp).await
+}
+
+/// Credentials for custom widget HTTP requests (port of v5/v6 `getHttpAuthenticationAsync`): v5 uses the
+/// `auth` query parameter, v6 the `sid` header of a stored session (validated with `GET /api/auth`, which
+/// answers 401 for an expired session so a new one is created only when needed).
+pub(crate) async fn http_auth(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+) -> HomarrResult<ResolvedHttpAuth> {
+    let Some(api_key) = ctx.secret("apiKey") else {
+        return Ok(ResolvedHttpAuth::default());
+    };
+    match detect_version(rt, ctx).await {
+        Version::V5 => Ok(ResolvedHttpAuth {
+            query: HashMap::from([("auth".to_string(), api_key.to_string())]),
+            redact_values: vec![api_key.to_string()],
+            ..Default::default()
+        }),
+        Version::V6 => {
+            v6_request(rt, ctx, reqwest::Method::GET, "/api/auth", None).await?;
+            let sid = rt
+                .sessions
+                .get::<Option<String>>(ctx)
+                .flatten()
+                .ok_or_else(|| {
+                    HomarrError::Upstream(format!(
+                        "{} did not return an authenticated session",
+                        ctx.name
+                    ))
+                })?;
+            Ok(ResolvedHttpAuth {
+                headers: HashMap::from([("sid".to_string(), sid.clone())]),
+                redact_values: vec![sid],
+                ..Default::default()
+            })
+        }
+    }
 }
 
 // ---- trait --------------------------------------------------------------------------------------

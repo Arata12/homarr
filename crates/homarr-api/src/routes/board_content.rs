@@ -43,6 +43,16 @@ fn valid_hex_color(value: &str) -> bool {
     matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Converts legacy `"dynamic"` sections to `"container"`, like the original section schema.
+/// Call on submitted sections before [`validate_board_content`].
+pub fn normalize_legacy_sections(sections: &mut [SaveBoardSectionInput]) {
+    for s in sections {
+        if s.kind == "dynamic" {
+            s.kind = "container".into();
+        }
+    }
+}
+
 /// Validates the structure of a board content save. Integration permission checks are
 /// done separately in [`validate_item_integrations`].
 pub fn validate_board_content(
@@ -284,6 +294,16 @@ mod tests {
         assert!(validate_board_content(&layouts, &sections, &[item(0, 4)]).is_ok());
         assert!(validate_board_content(&layouts, &sections, &[item(2, 3)]).is_err());
         assert!(validate_board_content(&layouts, &sections, &[item(-1, 1)]).is_err());
+    }
+
+    #[test]
+    fn converts_legacy_dynamic_sections() {
+        let layouts = [layout("l1", 4)];
+        let mut sections = [section("s1")];
+        sections[0].kind = "dynamic".into();
+        normalize_legacy_sections(&mut sections);
+        assert_eq!(sections[0].kind, "container");
+        assert!(validate_board_content(&layouts, &sections, &[item(0, 4)]).is_ok());
     }
 
     #[test]

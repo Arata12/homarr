@@ -37,6 +37,10 @@ mod unraid;
 mod uptime_kuma;
 mod wud;
 
+pub(crate) use self::beszel::http_auth as beszel_http_auth;
+pub(crate) use self::openmediavault::http_auth as openmediavault_http_auth;
+pub(crate) use self::synology::http_auth as synology_http_auth;
+
 pub struct SystemsGroup;
 
 const KINDS: &[IntegrationKind] = &[

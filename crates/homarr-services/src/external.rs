@@ -759,8 +759,21 @@ fn compare_semver_gt(candidate: &str, current: &str) -> bool {
 }
 
 async fn tcp_minecraft_slp(host: &str, port: u16) -> HomarrResult<MinecraftStatus> {
-    let addr = format!("{host}:{port}");
-    let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&addr))
+    // Resolve once and connect only to checked addresses, so DNS rebinding can't reach loopback.
+    let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(4),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| HomarrError::Upstream("Minecraft DNS lookup timeout".into()))?
+    .map_err(|e| HomarrError::Upstream(format!("Minecraft DNS lookup failed: {e}")))?
+    .collect();
+    if addrs.is_empty() || addrs.iter().any(|a| homarr_common::is_blocked_ip(a.ip())) {
+        return Err(HomarrError::Forbidden(
+            "Minecraft server address is not allowed".into(),
+        ));
+    }
+    let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&addrs[..]))
         .await
         .map_err(|_| HomarrError::Upstream("Minecraft TCP connect timeout".into()))?
         .map_err(|e| HomarrError::Upstream(format!("Minecraft TCP connect failed: {e}")))?;

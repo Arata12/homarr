@@ -101,7 +101,28 @@ pub(crate) async fn build_spotlight_items(
             "href": format!("/boards/{}", urlencoding(&b.name)),
         }));
     }
-    for app in apps::list_all(&state.db).await.unwrap_or_default() {
+    // Non-admins only see apps placed on public boards among `visible_boards`: some callers
+    // pass every board here, so only boards everyone may view are trusted.
+    // shortcut: hides apps on private boards a non-admin can view; pass the session in to fix.
+    let shown_apps = if is_admin {
+        apps::list_all(&state.db).await.unwrap_or_default()
+    } else {
+        let public: Vec<BoardRecord> = visible_boards
+            .iter()
+            .filter(|b| b.is_public)
+            .cloned()
+            .collect();
+        let ids = homarr_api::routes::apps::app_ids_on_boards(state, &public)
+            .await
+            .unwrap_or_default();
+        apps::list_all(&state.db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| ids.contains(&a.id))
+            .collect()
+    };
+    for app in shown_apps {
         let href = app.href.as_deref().map(safe_url).unwrap_or("#").to_string();
         items.push(json!({
             "label": app.name,

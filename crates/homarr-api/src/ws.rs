@@ -12,7 +12,11 @@ use axum::{
     middleware::Next,
     response::IntoResponse,
 };
-use homarr_auth::{get_session_from_token, session_cookie_name, API_KEY_HEADER_NAME};
+use homarr_auth::{
+    can_view_board, get_session_from_token, session_cookie_name, AuthSession, API_KEY_HEADER_NAME,
+};
+use homarr_db::repos::boards;
+use homarr_redis::RedisStore;
 use serde_json::json;
 
 use crate::{
@@ -79,21 +83,44 @@ pub async fn ws_handler(
             })
         });
 
-    let is_admin = match session_token {
-        Some(tok) => get_session_from_token(&state.db, &tok)
-            .await
-            .ok()
-            .flatten()
-            .map(|s| s.is_admin())
-            .unwrap_or(false),
-        None => false,
+    let session = match session_token {
+        Some(tok) => get_session_from_token(&state.db, &tok).await.ok().flatten(),
+        None => None,
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, is_admin))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session))
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, is_admin: bool) {
+/// Whether a Redis broadcast may be forwarded to this client. Mirrors the original's
+/// per-subscription checks: ping results need a signed-in user, board events need view
+/// access to that board (signed-in if the event has no board id), everything else
+/// (cron job status, unknown channels) is admin-only.
+async fn may_receive(
+    state: &AppState,
+    session: Option<&AuthSession>,
+    channel: &str,
+    payload: &serde_json::Value,
+) -> bool {
+    match channel {
+        RedisStore::PING_EVENTS_CHANNEL => session.is_some(),
+        RedisStore::BOARD_EVENTS_CHANNEL => {
+            let Some(board_id) = payload.get("boardId").and_then(|v| v.as_str()) else {
+                return session.is_some();
+            };
+            match boards::get_by_id(&state.db, board_id).await {
+                Ok(Some(board)) => can_view_board(&state.db, session, &board)
+                    .await
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
+        _ => session.is_some_and(AuthSession::is_admin),
+    }
+}
+
+async fn handle_socket(mut socket: WebSocket, state: AppState, session: Option<AuthSession>) {
+    let is_admin = session.as_ref().is_some_and(AuthSession::is_admin);
     let mut redis_rx = state.redis.subscribe();
     let mut logs_rx = state.logs.subscribe();
     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
@@ -138,6 +165,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, is_admin: bool) {
                         Ok(v) => v,
                         Err(_) => serde_json::Value::String(env.payload),
                     };
+                    if !may_receive(&state, session.as_ref(), &env.channel, &payload_val).await {
+                        continue;
+                    }
                     let frame = json!({
                         "channel": env.channel,
                         "payload": payload_val

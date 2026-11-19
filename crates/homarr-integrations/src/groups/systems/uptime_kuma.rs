@@ -4,11 +4,13 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use homarr_common::HomarrResult;
+use percent_encoding::utf8_percent_encode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::http::{self, as_f64, str_of};
 use crate::error::parse_error;
+use crate::http_auth::URI_COMPONENT;
 use crate::runtime::IntegrationRuntime;
 use crate::types::IntegrationContext;
 
@@ -136,10 +138,9 @@ fn slug(ctx: &IntegrationContext) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// `encodeURIComponent` semantics for a path segment (space is `%20`, never `+`).
 fn encode(slug: &str) -> String {
-    url::form_urlencoded::byte_serialize(slug.as_bytes())
-        .collect::<String>()
-        .replace('+', "%20")
+    utf8_percent_encode(slug, URI_COMPONENT).to_string()
 }
 
 fn status_page_path(slug: &str) -> String {
@@ -588,6 +589,16 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_767_225_600_000; // 2026-01-01T00:00:00Z
+
+    #[test]
+    fn encodes_slug_like_encode_uri_component() {
+        assert_eq!(encode("my page"), "my%20page");
+        assert_eq!(encode("a+b/c?d#e&f"), "a%2Bb%2Fc%3Fd%23e%26f");
+        assert_eq!(encode("keep-_.!~*'()"), "keep-_.!~*'()");
+        assert_eq!(encode("ü"), "%C3%BC");
+        assert_eq!(status_page_path("a b"), "/api/status-page/a%20b");
+        assert_eq!(heartbeat_path("a b"), "/api/status-page/heartbeat/a%20b");
+    }
 
     #[test]
     fn parses_uptime_kuma_dates() {

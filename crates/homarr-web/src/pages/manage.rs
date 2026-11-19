@@ -89,7 +89,7 @@ pub(super) async fn render_manage_shell(
 ) -> Html<String> {
     let state = &web.app;
     let locale = web.i18n.negotiate(headers);
-    let visible_boards = boards::list_all(&state.db).await.unwrap_or_default();
+    let visible_boards = super::board::list_visible_boards(state, session).await;
     let is_admin = session.is_some_and(AuthSession::is_admin);
     let spotlight = build_spotlight_items(state, &visible_boards, is_admin, false).await;
     let ui = ServerUiSettings::load(&state.db).await;
@@ -1241,7 +1241,7 @@ pub async fn widget_preview_page(
 
     let locale = web.i18n.negotiate(&headers);
     let ui = ServerUiSettings::load(&state.db).await;
-    let visible = boards::list_all(&state.db).await.unwrap_or_default();
+    let visible = super::board::list_visible_boards(state, session.as_ref()).await;
     let is_admin = session.as_ref().is_some_and(AuthSession::is_admin);
     let spotlight = build_spotlight_items(state, &visible, is_admin, false).await;
     let mut ctx = PageContext {

@@ -33,8 +33,9 @@ mod tests {
             &json!({ "content": "<script>alert('xss')</script>" }),
             &json!({}),
         );
+        // Notebook HTML is sanitized: script elements are dropped together with their content.
         assert!(!html.contains("<script>"));
-        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("alert("));
 
         let bad_iframe = render_widget_html(
             WidgetKind::Iframe,

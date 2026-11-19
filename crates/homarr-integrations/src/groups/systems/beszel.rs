@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 use super::http;
 use crate::error::{parse_error, request_error, status_error};
+use crate::http_auth::ResolvedHttpAuth;
 use crate::runtime::IntegrationRuntime;
 use crate::types::IntegrationContext;
 
@@ -104,6 +105,19 @@ async fn authenticate(
         rt.sessions.clear(ctx);
     }
     login(rt, ctx).await
+}
+
+/// Credentials for custom widget HTTP requests (port of `getHttpAuthenticationAsync`).
+pub async fn http_auth(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+) -> HomarrResult<ResolvedHttpAuth> {
+    let token = authenticate(rt, ctx).await?.token;
+    Ok(ResolvedHttpAuth {
+        redact_values: vec![token.clone()],
+        headers: [("Authorization".to_string(), token)].into(),
+        ..Default::default()
+    })
 }
 
 pub async fn test_connection(

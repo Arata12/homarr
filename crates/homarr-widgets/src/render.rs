@@ -638,6 +638,153 @@ fn render_inline_md(escaped: &str) -> String {
     out
 }
 
+/// Finds the `>` that ends a tag, skipping quoted attribute values.
+fn tag_end(s: &str) -> Option<usize> {
+    let mut quote = None;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (None, '>') => return Some(i),
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if q == c => quote = None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Value of the first attribute named `wanted` in the attribute part of a tag.
+fn attr_value<'a>(attrs: &'a str, wanted: &str) -> Option<&'a str> {
+    let mut s = attrs;
+    loop {
+        s = s.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
+        if s.is_empty() {
+            return None;
+        }
+        let name_end = s
+            .find(|c: char| c.is_ascii_whitespace() || c == '=' || c == '/')
+            .unwrap_or(s.len());
+        let name = &s[..name_end];
+        s = s[name_end..].trim_start();
+        let mut value = None;
+        if let Some(v) = s.strip_prefix('=') {
+            let v = v.trim_start();
+            let (val, next) = match v.chars().next() {
+                Some(q @ ('"' | '\'')) => {
+                    let body = &v[1..];
+                    let e = body.find(q).unwrap_or(body.len());
+                    (&body[..e], body.get(e + 1..).unwrap_or(""))
+                }
+                _ => {
+                    let e = v.find(|c: char| c.is_ascii_whitespace()).unwrap_or(v.len());
+                    (&v[..e], &v[e..])
+                }
+            };
+            value = Some(val);
+            s = next;
+        }
+        if name.eq_ignore_ascii_case(wanted) {
+            return value;
+        }
+    }
+}
+
+/// Allowlist sanitizer for notebook HTML (the original stores Tiptap HTML). Keeps basic
+/// formatting tags without attributes, except `a[href]` with an http(s)/mailto URL; drops
+/// script-like elements with their content and every other tag (keeping its text).
+fn sanitize_notebook_html(input: &str) -> String {
+    const ALLOWED: &str = "p br strong em u s h1 h2 h3 h4 h5 h6 ul ol li blockquote code pre a hr \
+                           table thead tbody tr th td";
+    const DROP_WITH_CONTENT: &str =
+        "script style iframe object embed template noscript textarea title svg math";
+    let mut out = String::with_capacity(input.len());
+    let mut open: Vec<&str> = Vec::new();
+    let mut rest = input;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt].replace('>', "&gt;"));
+        let after = &rest[lt + 1..];
+        if let Some(comment) = after.strip_prefix("!--") {
+            rest = comment.find("-->").map_or("", |i| &comment[i + 3..]);
+            continue;
+        }
+        let closing = after.starts_with('/');
+        let name_src = if closing { &after[1..] } else { after };
+        if !name_src.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            if closing || after.starts_with(['!', '?']) {
+                // Doctype, processing instruction or bogus comment.
+                rest = after.find('>').map_or("", |i| &after[i + 1..]);
+            } else {
+                out.push_str("&lt;");
+                rest = after;
+            }
+            continue;
+        }
+        let name_len = name_src
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(name_src.len());
+        let name = name_src[..name_len].to_ascii_lowercase();
+        let Some(end) = tag_end(&name_src[name_len..]) else {
+            // Unterminated tag: drop the remainder.
+            rest = "";
+            break;
+        };
+        let attrs = &name_src[name_len..name_len + end];
+        rest = &name_src[name_len + end + 1..];
+        let allowed = ALLOWED.split_whitespace().find(|t| *t == name);
+        if closing {
+            if let Some(pos) = allowed.and_then(|tag| open.iter().rposition(|t| *t == tag)) {
+                for t in open.drain(pos..).rev() {
+                    out.push_str("</");
+                    out.push_str(t);
+                    out.push('>');
+                }
+            }
+            continue;
+        }
+        if DROP_WITH_CONTENT.split(' ').any(|t| t == name) {
+            let lower = rest.to_ascii_lowercase();
+            rest = match lower.find(&format!("</{name}")) {
+                Some(i) => rest[i..].find('>').map_or("", |j| &rest[i + j + 1..]),
+                None => "",
+            };
+            continue;
+        }
+        let Some(tag) = allowed else {
+            continue;
+        };
+        out.push('<');
+        out.push_str(tag);
+        if tag == "a" {
+            if let Some(href) = attr_value(attrs, "href").map(str::trim) {
+                let lower = href.to_ascii_lowercase();
+                if ["http://", "https://", "mailto:"]
+                    .iter()
+                    .any(|p| lower.starts_with(p))
+                {
+                    // `&` stays as written: entities like `&amp;` are valid inside attributes.
+                    let href = href
+                        .replace('"', "&quot;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;");
+                    out.push_str(&format!(
+                        r#" href="{href}" target="_blank" rel="noopener noreferrer""#
+                    ));
+                }
+            }
+        }
+        out.push('>');
+        if tag != "br" && tag != "hr" {
+            open.push(tag);
+        }
+    }
+    out.push_str(&rest.replace('>', "&gt;"));
+    for t in open.into_iter().rev() {
+        out.push_str("</");
+        out.push_str(t);
+        out.push('>');
+    }
+    out
+}
+
 fn render_notebook(options: &Value) -> String {
     let content = options
         .get("content")
@@ -645,6 +792,13 @@ fn render_notebook(options: &Value) -> String {
         .unwrap_or("");
     if content.trim().is_empty() {
         return r#"<div class="widget-empty">Empty note</div>"#.to_string();
+    }
+    // Content saved by the original (Tiptap) is HTML; older port content is markdown-like text.
+    if content.trim_start().starts_with('<') {
+        return format!(
+            r#"<div class="notebook-body">{}</div>"#,
+            sanitize_notebook_html(content)
+        );
     }
     let mut html = String::from(r#"<div class="notebook-body">"#);
     let mut in_list = false;
@@ -1787,4 +1941,52 @@ fn render_generic(data: &Value) -> String {
         r#"<pre class="generic-json">{}</pre>"#,
         encode_text(&clipped)
     )
+}
+
+#[cfg(test)]
+mod notebook_sanitizer_tests {
+    use super::sanitize_notebook_html as clean;
+
+    #[test]
+    fn removes_scripts_and_event_attributes() {
+        assert_eq!(clean("<p>a<script>alert(1)</script>b</p>"), "<p>ab</p>");
+        assert_eq!(clean("<SCRIPT>x</SCRIPT >ok"), "ok");
+        assert_eq!(clean(r#"<img src=x onerror="alert(1)">t"#), "t");
+        assert_eq!(
+            clean(r#"<p onclick="x()" style="color:red">t</p>"#),
+            "<p>t</p>"
+        );
+        assert_eq!(clean("<style>p{}</style><svg onload=x><p>a</p></svg>"), "");
+        assert_eq!(clean("a < b > c <!-- <script> -->"), "a &lt; b &gt; c ");
+        assert_eq!(clean(r#"<p title="a>b">t</p>"#), "<p>t</p>");
+        assert_eq!(clean("<p>unterminated <b"), "<p>unterminated </p>");
+    }
+
+    #[test]
+    fn filters_link_targets() {
+        assert_eq!(clean(r#"<a href="javascript:alert(1)">x</a>"#), "<a>x</a>");
+        assert_eq!(clean(r#"<a href=" JaVaScRiPt:alert(1)">x</a>"#), "<a>x</a>");
+        assert_eq!(clean(r#"<a href="jav&#x61;script:x">x</a>"#), "<a>x</a>");
+        assert_eq!(
+            clean(r#"<a onclick="x" href='https://e.com/?a=1&amp;b="2"'>x</a>"#),
+            r#"<a href="https://e.com/?a=1&amp;b=&quot;2&quot;" target="_blank" rel="noopener noreferrer">x</a>"#
+        );
+        assert!(clean(r#"<a href="mailto:a@b.c">m</a>"#).contains(r#"href="mailto:a@b.c""#));
+    }
+
+    #[test]
+    fn keeps_formatting() {
+        let html =
+            "<h2>T</h2><p><strong>b</strong> <em>i</em> <u>u</u> <s>s</s> <code>c</code></p>\
+                    <ul><li>x</li></ul><ol><li>y</li></ol><blockquote>q</blockquote><pre>p</pre>\
+                    <hr><br><table><tbody><tr><td>c</td></tr></tbody></table>";
+        assert_eq!(clean(html), html);
+        assert_eq!(
+            clean(r#"<p style="text-align:center"><span style="color:red">r</span></p>"#),
+            "<p>r</p>"
+        );
+        // Unbalanced markup is closed.
+        assert_eq!(clean("<ul><li>a</ul>b</p>"), "<ul><li>a</li></ul>b");
+        assert_eq!(clean("<p><em>a"), "<p><em>a</em></p>");
+    }
 }

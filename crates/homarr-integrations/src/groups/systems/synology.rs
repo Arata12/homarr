@@ -13,6 +13,7 @@ use crate::capabilities::health_monitoring::{
     FileSystemInfo, LoadAverage, NetworkThroughput, SmartInfo, SystemHealthMonitoring,
 };
 use crate::error::{parse_error, status_error};
+use crate::http_auth::ResolvedHttpAuth;
 use crate::runtime::IntegrationRuntime;
 use crate::types::IntegrationContext;
 
@@ -216,6 +217,28 @@ async fn request_once(
         }
         None => Err(parse_error(ctx, api_name, "missing success flag")),
     }
+}
+
+/// Credentials for custom widget HTTP requests (port of `getHttpAuthenticationAsync`): the stored session
+/// cookie, logging in (and storing it for 10 minutes) when there is none.
+pub async fn http_auth(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+) -> HomarrResult<ResolvedHttpAuth> {
+    let session = match rt.sessions.get::<StoredSession>(ctx) {
+        Some(session) => session,
+        None => {
+            let session = login(rt, ctx).await?;
+            rt.sessions
+                .set(ctx, &session, Some(std::time::Duration::from_secs(600)));
+            session
+        }
+    };
+    Ok(ResolvedHttpAuth {
+        redact_values: vec![session.cookie_header.clone()],
+        headers: [("Cookie".to_string(), session.cookie_header)].into(),
+        ..Default::default()
+    })
 }
 
 /// Runs an API call with the stored session, logging in again when DSM reports an expired session.

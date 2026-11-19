@@ -42,6 +42,8 @@ mod util;
 mod wazuh;
 mod ws;
 
+pub(crate) use self::wazuh::http_auth as wazuh_http_auth;
+
 pub struct HomeMiscGroup;
 
 const KINDS: &[IntegrationKind] = &[

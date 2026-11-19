@@ -24,7 +24,10 @@ use crate::layout::{
 };
 use crate::WebState;
 
-async fn list_visible_boards(state: &AppState, session: Option<&AuthSession>) -> Vec<BoardRecord> {
+pub(crate) async fn list_visible_boards(
+    state: &AppState,
+    session: Option<&AuthSession>,
+) -> Vec<BoardRecord> {
     let all = boards::list_all(&state.db).await.unwrap_or_default();
     let mut visible = Vec::new();
     for b in all {

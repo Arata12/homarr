@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use homarr_auth::hash_password;
-use homarr_common::HomarrError;
+use homarr_common::{generate_secure_random_token, HomarrError};
 use homarr_core::{AppConfig, DatabaseDriver};
 use homarr_db::{
-    repos::{groups, integrations, users},
+    repos::{groups, integrations, sessions, users},
     seed::seed_defaults,
     Database,
 };
@@ -44,10 +44,22 @@ enum Commands {
 #[derive(Subcommand)]
 enum UsersCmd {
     List,
-    Delete { id: String },
-    ResetPassword { id: String, password: String },
+    Delete {
+        id: String,
+    },
+    /// Sets a new random password (printed once) and signs the user out everywhere.
+    ResetPassword {
+        id: String,
+        /// Deprecated: visible to other local users via the process list. Omit to generate one.
+        password: Option<String>,
+    },
     FixUsernames,
-    RecreateAdmin { username: String, password: String },
+    /// Creates or resets a credentials admin with a random password (printed once).
+    RecreateAdmin {
+        username: String,
+        /// Deprecated: visible to other local users via the process list. Omit to generate one.
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -124,6 +136,23 @@ fn parse_healthcheck_target(url: Option<&str>) -> Result<(String, u16, String), 
     Ok((host, port, path))
 }
 
+/// Returns the password to set and whether it was generated (and so must be printed).
+fn resolve_password(supplied: Option<String>) -> Result<(String, bool), HomarrError> {
+    let Some(password) = supplied else {
+        // 24 random bytes hex-encoded = 48 characters, as upstream.
+        return Ok((generate_secure_random_token(24), true));
+    };
+    eprintln!(
+        "warning: passwords given on the command line are visible to other users (process list, shell history); omit it to generate one"
+    );
+    if password.chars().count() < 8 {
+        return Err(HomarrError::BadRequest(
+            "Password must be >= 8 chars".into(),
+        ));
+    }
+    Ok((password, false))
+}
+
 async fn run_healthcheck(url: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let (host, port, path) = parse_healthcheck_target(url).map_err(HomarrError::BadRequest)?;
     let probe = async {
@@ -178,23 +207,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("deleted={ok}");
             }
             UsersCmd::ResetPassword { id, password } => {
-                if users::find_by_id(&db, &id).await?.is_none() {
-                    return Err(HomarrError::NotFound(format!("User {id} not found")).into());
+                let user = users::find_by_id(&db, &id)
+                    .await?
+                    .ok_or_else(|| HomarrError::NotFound(format!("User {id} not found")))?;
+                if user.provider != "credentials" {
+                    let msg = format!("User {id} does not use the credentials provider");
+                    return Err(msg.into());
                 }
+                let (password, generated) = resolve_password(password)?;
                 let hash = hash_password(&password).await?;
                 users::update_password(&db, &id, &hash).await?;
-                println!("Password reset for user {id}");
+                let removed = sessions::delete_by_user_id(&db, &id).await?;
+                println!("Password reset for user {id}; deleted {removed} session(s)");
+                if generated {
+                    println!("New password: {password}");
+                }
             }
             UsersCmd::FixUsernames => {
                 let count = users::fix_usernames(&db).await?;
                 println!("Normalized {count} usernames");
             }
             UsersCmd::RecreateAdmin { username, password } => {
+                let existing = users::find_by_name_ci(&db, &username).await?;
+                if matches!(&existing, Some(u) if u.provider != "credentials") {
+                    let msg = format!("User {username} does not use the credentials provider");
+                    return Err(msg.into());
+                }
+                let (password, generated) = resolve_password(password)?;
                 seed_defaults(&db).await?;
                 let hash = hash_password(&password).await?;
-                let user = match users::find_by_name_ci(&db, &username).await? {
+                let user = match existing {
                     Some(existing) => {
                         users::update_password(&db, &existing.id, &hash).await?;
+                        sessions::delete_by_user_id(&db, &existing.id).await?;
                         existing
                     }
                     None => {
@@ -229,6 +274,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     user.name.unwrap_or_default(),
                     user.id
                 );
+                if generated {
+                    println!("Password: {password}");
+                }
             }
         },
         Commands::Integrations { action } => match action {

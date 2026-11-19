@@ -26,7 +26,9 @@ use homarr_widgets::sanitize_widget_options;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::board_content::{validate_board_content, validate_item_integrations};
+use super::board_content::{
+    normalize_legacy_sections, validate_board_content, validate_item_integrations,
+};
 use crate::state::AppState;
 
 /// Custom widgets call integrations without the viewer's session when the board renders, so
@@ -302,6 +304,7 @@ pub async fn save_board_layout(
     let current = boards::get_full_board_by_id(&state.db, &id)
         .await?
         .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
+    normalize_legacy_sections(&mut body.sections);
     validate_board_content(&current.layouts, &body.sections, &body.items)?;
     validate_item_integrations(&state.db, &session, &body.items, &current.items).await?;
     for item in &mut body.items {
@@ -556,38 +559,71 @@ pub async fn delete_board_section(
         .await?
         .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
 
-    let sections_in: Vec<SaveBoardSectionInput> = full
+    let target = full
         .sections
         .iter()
-        .filter(|s| s.id != section_id)
-        .map(|s| SaveBoardSectionInput {
-            id: s.id.clone(),
-            kind: s.kind.clone(),
-            x_offset: s.x_offset,
-            y_offset: s.y_offset,
-            name: s.name.clone(),
-            options: s.options.clone(),
-            layouts: s.layouts.clone(),
-        })
-        .collect();
+        .find(|s| s.id == section_id)
+        .cloned()
+        .ok_or_else(|| HomarrError::NotFound("Section not found".into()))?;
+
+    // Like the original container removal, child sections move up into the removed section's
+    // parent (offsets shifted) per layout; children that cannot be re-parented are removed.
+    let mut removed = std::collections::HashSet::from([section_id.clone()]);
+    let mut sections_in = to_section_inputs(&full);
+    for s in &mut sections_in {
+        for l in &mut s.layouts {
+            if l.parent_section_id.as_deref() != Some(section_id.as_str()) {
+                continue;
+            }
+            let parent = target
+                .layouts
+                .iter()
+                .find(|r| r.layout_id == l.layout_id && r.parent_section_id.is_some());
+            match parent {
+                Some(r) => {
+                    l.parent_section_id = r.parent_section_id.clone();
+                    l.x_offset += r.x_offset;
+                    l.y_offset += r.y_offset;
+                }
+                None => {
+                    removed.insert(s.id.clone());
+                }
+            }
+        }
+    }
+    // Descendants of removed sections go too.
+    loop {
+        let before = removed.len();
+        for s in &sections_in {
+            let orphan = s.layouts.iter().any(|l| {
+                l.parent_section_id
+                    .as_ref()
+                    .is_some_and(|p| removed.contains(p))
+            });
+            if orphan {
+                removed.insert(s.id.clone());
+            }
+        }
+        if removed.len() == before {
+            break;
+        }
+    }
+    sections_in.retain(|s| !removed.contains(&s.id));
     if sections_in.is_empty() {
         return Err(HomarrError::BadRequest(
             "A board must have at least one section".into(),
         ));
     }
-    let items_in: Vec<SaveBoardItemInput> = full
-        .items
-        .into_iter()
-        .filter(|i| !i.layouts.iter().any(|l| l.section_id == section_id))
-        .map(|i| SaveBoardItemInput {
-            id: i.id,
-            kind: i.kind,
-            options: i.options,
-            advanced_options: i.advanced_options,
-            layouts: i.layouts,
-            integration_ids: i.integration_ids,
-        })
-        .collect();
+
+    // Only the placements inside removed sections go; an item is deleted only when that was
+    // its last placement.
+    let mut items_in = to_item_inputs(&full);
+    items_in.retain_mut(|i| {
+        let had_placements = !i.layouts.is_empty();
+        i.layouts.retain(|l| !removed.contains(&l.section_id));
+        !had_placements || !i.layouts.is_empty()
+    });
+    validate_board_content(&full.layouts, &sections_in, &items_in)?;
     let updated = boards::save_board_content(&state.db, &board_id, &sections_in, &items_in).await?;
     Ok(Json(updated))
 }
@@ -949,6 +985,7 @@ pub async fn import_board(
         });
     }
 
+    normalize_legacy_sections(&mut remapped_sections);
     validate_board_content(&layout_records, &remapped_sections, &remapped_items)?;
     validate_item_integrations(&state.db, &session, &remapped_items, &[]).await?;
     ensure_custom_widget_changes_allowed(&session, &remapped_items, &[])?;

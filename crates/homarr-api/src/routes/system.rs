@@ -195,8 +195,8 @@ pub async fn import_backup(
     Json(bundle): Json<HomarrBackupBundle>,
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
-    import_backup_json(&state.db, &bundle).await?;
-    Ok(Json(json!({ "ok": true })))
+    let summary = import_backup_json(&state.db, &bundle).await?;
+    Ok(Json(json!({ "ok": true, "summary": summary })))
 }
 
 pub async fn get_assistant_config(
@@ -235,10 +235,21 @@ pub async fn save_assistant_config(
     Json(body): Json<SaveAssistantConfigBody>,
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
+    let base_url = normalize_assistant_base_url(&body.base_url)?;
+    let existing = assistant::get_config(&state.db).await?;
+    // Stored credentials must never be sent to a different provider/host.
+    let destination_changed = existing.provider != body.provider || existing.base_url != base_url;
     let encrypted_api_key = if let Some(raw) = body.api_key.filter(|s| !s.trim().is_empty()) {
         Some(state.crypto.encrypt_secret(raw.trim())?)
-    } else {
+    } else if destination_changed {
         None
+    } else {
+        existing.encrypted_api_key
+    };
+    let encrypted_headers = if destination_changed {
+        None
+    } else {
+        existing.encrypted_headers
     };
     assistant::save_config(
         &state.db,
@@ -247,16 +258,32 @@ pub async fn save_assistant_config(
             enabled: body.enabled,
             web_search_enabled: body.web_search_enabled,
             provider: body.provider,
-            base_url: body.base_url,
+            base_url,
             model_discovery_path: body.model_discovery_path,
             encrypted_api_key,
-            encrypted_headers: None,
+            encrypted_headers,
             model_id: body.model_id,
             updated_at: 0,
         },
     )
     .await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+fn normalize_assistant_base_url(value: &str) -> HomarrResult<String> {
+    let url = url::Url::parse(value.trim())
+        .map_err(|_| HomarrError::BadRequest("Enter a valid provider URL.".into()))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(HomarrError::BadRequest(
+            "Provider URL must use HTTP(S) without credentials, query or fragment.".into(),
+        ));
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 pub async fn list_assistant_threads(

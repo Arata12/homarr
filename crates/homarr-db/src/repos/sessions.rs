@@ -132,3 +132,21 @@ pub async fn delete_expired(db: &Database, now_ms: i64) -> HomarrResult<u64> {
     };
     Ok(affected)
 }
+
+pub async fn delete_by_user_id(db: &Database, user_id: &str) -> HomarrResult<u64> {
+    let affected = match db {
+        Database::Sqlite(pool) => sqlx::query(r#"DELETE FROM "session" WHERE "user_id" = ?"#)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_err)?
+            .rows_affected(),
+        Database::Postgres(pool) => sqlx::query(r#"DELETE FROM "session" WHERE "user_id" = $1"#)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_err)?
+            .rows_affected(),
+    };
+    Ok(affected)
+}

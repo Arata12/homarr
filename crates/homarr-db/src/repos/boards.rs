@@ -1590,7 +1590,6 @@ pub async fn duplicate_board(
             resize_source: l.resize_source.clone(),
         })
         .collect();
-    replace_layouts(db, &new_board_id, &norm_layouts).await?;
 
     let sections: Vec<SaveBoardSectionInput> = source
         .sections
@@ -1656,7 +1655,17 @@ pub async fn duplicate_board(
         })
         .collect();
 
-    save_board_content(db, &new_board_id, &sections, &items).await
+    let filled = match replace_layouts(db, &new_board_id, &norm_layouts).await {
+        Ok(_) => save_board_content(db, &new_board_id, &sections, &items).await,
+        Err(err) => Err(err),
+    };
+    if filled.is_err() {
+        // The helpers commit separately; remove the half-built copy (cascades to its children).
+        if let Err(err) = delete(db, &new_board_id).await {
+            tracing::error!("Could not remove partial board copy {new_board_id}: {err}");
+        }
+    }
+    filled
 }
 
 pub async fn create_board_item(

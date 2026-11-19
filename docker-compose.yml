@@ -81,6 +81,10 @@ services:
       ASSETS_DIR: /app/assets
       WORKSHOP_API_URL: ${WORKSHOP_API_URL:-http://workshop:8090}
       WORKSHOP_WEB_URL: ${WORKSHOP_WEB_URL:-http://localhost:8090}
+      # The server runs as uid/gid 1000 by default; the entrypoint chowns /appdata/{db,secrets,
+      # trusted-certificates} on start. Set PUID/PGID to run as another user (both 0 = root).
+      # PUID: "1000"
+      # PGID: "1000"
 
   workshop:
     build:

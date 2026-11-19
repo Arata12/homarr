@@ -4,16 +4,22 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use homarr_auth::{hash_password, verify_password, RequireAdmin, RequireAuth};
+use homarr_auth::{can_view_board, hash_password, verify_password, RequireAdmin, RequireAuth};
 use homarr_common::{HomarrError, HomarrResult};
-use homarr_db::repos::{
-    groups, invites,
-    users::{self, CreateUserInput, UpdateUserPreferencesInput},
+use homarr_db::{
+    models::GroupRecord,
+    repos::{
+        boards, groups, invites,
+        users::{self, CreateUserInput, UpdateUserPreferencesInput},
+    },
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
+
+/// Built-in group every user belongs to; it cannot be renamed, deleted or have members edited.
+const EVERYONE_GROUP: &str = "everyone";
 
 pub async fn list_users(
     RequireAdmin(_admin): RequireAdmin,
@@ -128,10 +134,19 @@ pub async fn update_user(
             }
         }
     }
+    let name = body.name.as_deref().map(str::trim);
+    if let Some(name) = name {
+        // No unique index on "user"."name": case-insensitive duplicates make login ambiguous.
+        if let Some(existing) = users::find_by_name_ci(&state.db, name).await? {
+            if existing.id != id {
+                return Err(HomarrError::Conflict("Username already taken".into()));
+            }
+        }
+    }
     users::update_profile(
         &state.db,
         &id,
-        body.name.as_deref(),
+        name,
         body.email.as_deref(),
         body.image.as_deref(),
     )
@@ -188,6 +203,17 @@ pub async fn update_my_preferences(
     Json(body): Json<PreferencesBody>,
 ) -> HomarrResult<Json<Value>> {
     session.require_writable(state.demo_read_only_active())?;
+    for board_id in [&body.home_board_id, &body.mobile_home_board_id]
+        .into_iter()
+        .filter_map(|b| b.as_ref()?.as_deref())
+    {
+        let board = boards::get_by_id(&state.db, board_id)
+            .await?
+            .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
+        if !can_view_board(&state.db, Some(&session), &board).await? {
+            return Err(HomarrError::Forbidden("Forbidden".into()));
+        }
+    }
     let updated = users::update_preferences(
         &state.db,
         &session.user_id,
@@ -237,6 +263,7 @@ pub async fn create_group(
     Json(body): Json<CreateGroupBody>,
 ) -> HomarrResult<(StatusCode, Json<Value>)> {
     admin.require_writable(state.demo_read_only_active())?;
+    reject_reserved_group_name(&body.name)?;
     let all = groups::list_all(&state.db).await?;
     let pos = all.len() as i32;
     let group = groups::create(&state.db, body.name.trim(), Some(&admin.user_id), pos).await?;
@@ -269,12 +296,22 @@ pub async fn update_group(
     Json(body): Json<UpdateGroupBody>,
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
+    if let Some(name) = body.name.as_deref() {
+        let group = groups::get_by_id(&state.db, &id)
+            .await?
+            .ok_or_else(|| HomarrError::NotFound("Group not found".into()))?;
+        // Re-sending the unchanged name (e.g. alongside home board settings) is not a rename.
+        if group.name != name.trim() {
+            reject_reserved_group(&group)?;
+            reject_reserved_group_name(name)?;
+        }
+    }
     let home = body.home_board_id;
     let mobile = body.mobile_home_board_id;
     let updated = groups::update_settings(
         &state.db,
         &id,
-        body.name.as_deref(),
+        body.name.as_deref().map(str::trim),
         home.as_ref().map(|o| o.as_deref()),
         mobile.as_ref().map(|o| o.as_deref()),
     )
@@ -288,6 +325,7 @@ pub async fn delete_group(
     Path(id): Path<String>,
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
+    reject_reserved_group_id(&state, &id).await?;
     let deleted = groups::delete(&state.db, &id).await?;
     if !deleted {
         return Err(HomarrError::NotFound("Group not found".into()));
@@ -317,6 +355,7 @@ pub async fn add_group_member(
     Path((id, user_id)): Path<(String, String)>,
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
+    reject_reserved_group_id(&state, &id).await?;
     groups::add_member(&state.db, &id, &user_id).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -327,8 +366,32 @@ pub async fn remove_group_member(
     Path((id, user_id)): Path<(String, String)>,
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
+    reject_reserved_group_id(&state, &id).await?;
     groups::remove_member(&state.db, &id, &user_id).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+fn reject_reserved_group(group: &GroupRecord) -> HomarrResult<()> {
+    if group.name == EVERYONE_GROUP {
+        return Err(HomarrError::Forbidden(
+            "Action is forbidden for reserved group names".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_reserved_group_name(name: &str) -> HomarrResult<()> {
+    if name.trim().eq_ignore_ascii_case(EVERYONE_GROUP) {
+        return Err(HomarrError::Conflict("Group name is reserved".into()));
+    }
+    Ok(())
+}
+
+async fn reject_reserved_group_id(state: &AppState, id: &str) -> HomarrResult<()> {
+    match groups::get_by_id(&state.db, id).await? {
+        Some(group) => reject_reserved_group(&group),
+        None => Ok(()),
+    }
 }
 
 pub async fn list_invites(

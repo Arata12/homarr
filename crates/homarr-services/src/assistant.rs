@@ -1,11 +1,34 @@
 use homarr_common::{HomarrError, HomarrResult, SecretCrypto};
-use homarr_core::{AppConfig, HttpClientFactory};
+use homarr_core::{read_bounded_bytes, AppConfig, HttpClientFactory};
 use homarr_db::{
     models::{AssistantConfigRecord, AssistantMessageRecord},
     repos::assistant as repo,
     Database,
 };
 use serde_json::{json, Value};
+
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOGGED_ERROR_BODY_CHARS: usize = 512;
+
+/// Reads a provider response with a size cap. Error bodies are only logged
+/// (truncated, at debug) and never returned to the client.
+async fn read_provider_json(resp: reqwest::Response, provider: &str) -> HomarrResult<Value> {
+    let status = resp.status();
+    let bytes = read_bounded_bytes(resp, MAX_PROVIDER_RESPONSE_BYTES)
+        .await
+        .map_err(|_| HomarrError::Upstream(format!("{provider} response could not be read")))?;
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&bytes);
+        let truncated: String = body.chars().take(MAX_LOGGED_ERROR_BODY_CHARS).collect();
+        tracing::debug!(%status, provider, body = %truncated, "LLM provider returned an error");
+        return Err(HomarrError::Upstream(format!(
+            "{provider} returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| HomarrError::Upstream(format!("{provider} returned an invalid response")))
+}
 
 #[derive(Clone)]
 pub struct AssistantService {
@@ -101,11 +124,10 @@ impl AssistantService {
                 }))
                 .send()
                 .await
-                .map_err(|e| HomarrError::Upstream(format!("Anthropic request failed: {e}")))?;
-            let body: Value = resp
-                .json()
-                .await
-                .map_err(|e| HomarrError::Upstream(e.to_string()))?;
+                .map_err(|e| {
+                    HomarrError::Upstream(format!("Anthropic request failed: {}", e.without_url()))
+                })?;
+            let body = read_provider_json(resp, "Anthropic").await?;
             let text = body
                 .get("content")
                 .and_then(|c| c.as_array())
@@ -129,11 +151,10 @@ impl AssistantService {
                 }))
                 .send()
                 .await
-                .map_err(|e| HomarrError::Upstream(format!("Ollama request failed: {e}")))?;
-            let body: Value = resp
-                .json()
-                .await
-                .map_err(|e| HomarrError::Upstream(e.to_string()))?;
+                .map_err(|e| {
+                    HomarrError::Upstream(format!("Ollama request failed: {}", e.without_url()))
+                })?;
+            let body = read_provider_json(resp, "Ollama").await?;
             let text = body
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -154,20 +175,10 @@ impl AssistantService {
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| HomarrError::Upstream(format!("LLM request failed: {e}")))?;
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| HomarrError::Upstream(e.to_string()))?;
-        if !status.is_success() {
-            return Err(HomarrError::Upstream(format!(
-                "LLM provider returned HTTP {status}: {body}"
-            )));
-        }
+        let resp = req.send().await.map_err(|e| {
+            HomarrError::Upstream(format!("LLM request failed: {}", e.without_url()))
+        })?;
+        let body = read_provider_json(resp, "LLM provider").await?;
         let text = body
             .get("choices")
             .and_then(|c| c.as_array())
