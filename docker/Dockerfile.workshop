@@ -11,7 +11,7 @@ COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
 COPY migrations ./migrations
 
-RUN cargo build --release --bin homarr-workshop
+RUN cargo build --release --locked --bin homarr-workshop
 
 FROM debian:bookworm-slim AS runner
 RUN apt-get update && apt-get install -y --no-install-recommends \

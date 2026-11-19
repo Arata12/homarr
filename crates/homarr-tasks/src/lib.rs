@@ -16,7 +16,7 @@ use homarr_integrations::{IntegrationContext, IntegrationRegistry};
 use homarr_redis::RedisStore;
 use homarr_services::ServiceContainer;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
@@ -495,6 +495,7 @@ impl TaskScheduler {
                     IntegrationKind::Jellyfin
                         | IntegrationKind::Emby
                         | IntegrationKind::Plex
+                        | IntegrationKind::Navidrome
                         | IntegrationKind::Mock
                 ) | (
                     "downloads",
@@ -504,6 +505,7 @@ impl TaskScheduler {
                         | IntegrationKind::SabNzbd
                         | IntegrationKind::NzbGet
                         | IntegrationKind::Aria2
+                        | IntegrationKind::Slskd
                         | IntegrationKind::Mock
                 ) | (
                     "dnsHole",
@@ -518,14 +520,20 @@ impl TaskScheduler {
                         | IntegrationKind::Glances
                         | IntegrationKind::DashDot
                         | IntegrationKind::Unraid
+                        | IntegrationKind::Synology
+                        | IntegrationKind::Openmediavault
+                        | IntegrationKind::Truenas
                         | IntegrationKind::Mock
                 ) | (
                     "calendar",
                     IntegrationKind::Sonarr
+                        | IntegrationKind::Sportarr
                         | IntegrationKind::Radarr
                         | IntegrationKind::Lidarr
                         | IntegrationKind::Readarr
                         | IntegrationKind::Ical
+                        | IntegrationKind::Nextcloud
+                        | IntegrationKind::HomeAssistant
                         | IntegrationKind::Mock
                 ) | (
                     "indexerManager",
@@ -586,7 +594,31 @@ impl TaskScheduler {
                     .await
                     .ok()
                     .and_then(|v| serde_json::to_value(v).ok()),
-                _ => Some(json!({ "ok": true })),
+                "calendar" => self
+                    .integrations
+                    .get_calendar_events(&ctx, None, None)
+                    .await
+                    .ok()
+                    .and_then(|v| serde_json::to_value(v).ok()),
+                "indexerManager" => self
+                    .integrations
+                    .get_indexers(&ctx)
+                    .await
+                    .ok()
+                    .and_then(|v| serde_json::to_value(v).ok()),
+                "mediaRequests" => self
+                    .integrations
+                    .get_media_requests(&ctx)
+                    .await
+                    .ok()
+                    .and_then(|v| serde_json::to_value(v).ok()),
+                "smartHome" => self
+                    .integrations
+                    .get_smart_home_entities(&ctx)
+                    .await
+                    .ok()
+                    .and_then(|v| serde_json::to_value(v).ok()),
+                _ => None,
             };
             if let Some(val) = cached_val {
                 let _ = self

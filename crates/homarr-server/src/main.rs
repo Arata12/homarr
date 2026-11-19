@@ -42,10 +42,22 @@ async fn connect_redis_with_retry(config: &AppConfig) -> RedisStore {
     if config.redis_disabled {
         return RedisStore::in_memory();
     }
+    // redis' ConnectionManager retries internally with backoff, so bound each
+    // attempt; otherwise an unreachable Redis blocks startup indefinitely.
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
     for attempt in 1..=5 {
-        match RedisStore::connect(config).await {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, RedisStore::connect(config))
+            .await
+            .unwrap_or_else(|_| {
+                Err(homarr_common::HomarrError::Upstream(
+                    "Redis connection timed out".to_string(),
+                ))
+            }) {
             Ok(store) => {
-                if store.health_check().await.is_ok() {
+                if matches!(
+                    tokio::time::timeout(ATTEMPT_TIMEOUT, store.health_check()).await,
+                    Ok(Ok(_))
+                ) {
                     return store;
                 }
             }

@@ -28,6 +28,8 @@ struct StoredImagePayload {
     url: String,
     #[serde(default)]
     headers: HashMap<String, String>,
+    #[serde(default)]
+    trusted_origin: Option<String>,
 }
 
 #[derive(Debug)]
@@ -113,10 +115,20 @@ impl ImageProxyService {
         url: &str,
         headers: HashMap<String, String>,
     ) -> HomarrResult<String> {
-        let _ = validate_outbound_url(url, None)?;
+        self.forward_trusted_image(url, headers, None).await
+    }
+
+    pub async fn forward_trusted_image(
+        &self,
+        url: &str,
+        headers: HashMap<String, String>,
+        trusted_origin: Option<String>,
+    ) -> HomarrResult<String> {
+        let _ = validate_outbound_url(url, trusted_origin.as_deref())?;
         let payload = StoredImagePayload {
             url: url.to_string(),
             headers,
+            trusted_origin,
         };
         let json = serde_json::to_string(&payload)
             .map_err(|err| HomarrError::Internal(format!("Image payload encode failed: {err}")))?;
@@ -144,7 +156,12 @@ impl ImageProxyService {
 
         let (bytes, content_type, status) = self
             .http
-            .guarded_get(&payload.url, Some(&payload.headers), None, MAX_IMAGE_BYTES)
+            .guarded_get(
+                &payload.url,
+                Some(&payload.headers),
+                payload.trusted_origin.as_deref(),
+                MAX_IMAGE_BYTES,
+            )
             .await?;
         if status >= 400 {
             return Err(HomarrError::Upstream(format!(
@@ -189,5 +206,18 @@ impl ImageProxyService {
             .map_err(|_| HomarrError::Forbidden("Image token decryption failed".to_string()))?;
         String::from_utf8(plain)
             .map_err(|err| HomarrError::Internal(format!("Invalid decrypted UTF-8: {err}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl homarr_integrations::runtime::ImageProxyProvider for ImageProxyService {
+    async fn proxy_image(
+        &self,
+        url: &str,
+        headers: HashMap<String, String>,
+        trusted_origin: Option<String>,
+    ) -> HomarrResult<String> {
+        self.forward_trusted_image(url, headers, trusted_origin)
+            .await
     }
 }

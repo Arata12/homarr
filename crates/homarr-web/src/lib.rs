@@ -45,6 +45,7 @@ pub fn web_router(state: AppState) -> Router {
         .route("/manage/boards", get(manage::boards_page))
         .route("/manage/apps", get(manage::apps_page))
         .route("/manage/integrations", get(manage::integrations_page))
+        .route("/manage/search-engines", get(manage::search_engines_page))
         .route("/manage/users", get(manage::users_page))
         .route("/manage/users/groups", get(manage::groups_page))
         .route("/manage/users/invites", get(manage::invites_page))

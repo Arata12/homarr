@@ -35,16 +35,19 @@ async fn resolve_session<S: AuthContextProvider>(
     parts: &Parts,
     state: &S,
 ) -> Result<Option<AuthSession>, HomarrError> {
-    // 1. Check ApiKey header
-    if let Some(api_key_val) = parts
-        .headers
-        .get(API_KEY_HEADER_NAME)
-        .and_then(|v| v.to_str().ok())
-    {
+    // 1. Check ApiKey header (never fall back to session cookie when ApiKey is supplied)
+    if parts.headers.contains_key(API_KEY_HEADER_NAME) {
+        let Some(api_key_val) = parts
+            .headers
+            .get(API_KEY_HEADER_NAME)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Ok(None);
+        };
         return authenticate_api_key(state.db(), api_key_val).await;
     }
 
-    // 2. Check Authorization: Bearer <id.secret>
+    // 2. Check Authorization: Bearer <id.secret> (never fall back to cookie when Bearer is supplied)
     if let Some(auth_val) = parts
         .headers
         .get(AUTHORIZATION)
@@ -54,15 +57,18 @@ async fn resolve_session<S: AuthContextProvider>(
             .strip_prefix("Bearer ")
             .or_else(|| auth_val.strip_prefix("bearer "))
         {
-            if let Some(sess) = authenticate_api_key(state.db(), token).await? {
-                return Ok(Some(sess));
-            }
+            return authenticate_api_key(state.db(), token).await;
         }
     }
 
-    // 3. Check session cookie
+    // 3. Check session cookie (iterate all Cookie headers for HTTP/2 compatibility)
     let cookie_name = session_cookie_name(&state.config().auth_cookie_prefix);
-    if let Some(cookie_hdr) = parts.headers.get(COOKIE).and_then(|v| v.to_str().ok()) {
+    for cookie_hdr in parts
+        .headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+    {
         if let Some(token) = extract_cookie_value(cookie_hdr, &cookie_name) {
             if let Some(sess) = get_session_from_token(state.db(), &token).await? {
                 return Ok(Some(sess));

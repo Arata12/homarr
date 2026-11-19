@@ -35,9 +35,10 @@ impl AppState {
         certs: CertificateManager,
         http: HttpClientFactory,
     ) -> Self {
-        let integrations = IntegrationRegistry::new(http.clone());
         let services =
             ServiceContainer::new(config.clone(), crypto.clone(), http.clone(), redis.clone());
+        let integrations =
+            IntegrationRegistry::with_image_proxy(http.clone(), services.image_proxy.clone());
         let scheduler = TaskScheduler::new(
             config.clone(),
             db.clone(),

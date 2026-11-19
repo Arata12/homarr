@@ -1,0 +1,209 @@
+name: Release (Rust binaries + Docker images)
+
+# On every published GitHub release:
+#   1. Build static (musl) binaries natively on x64 and arm64 runners.
+#   2. Attach linux-amd64 / linux-arm64 tarballs to the release.
+#   3. Package those same binaries into a distroless image per architecture
+#      (ghcr.io/<owner>/homarr:<version>-amd64 / -arm64).
+#   4. Publish a multi-arch manifest (<version>, and latest for stable releases).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to (re)build, e.g. v3.0.0
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  # Native musl toolchain: Alpine targets *-unknown-linux-musl and links statically.
+  RUST_IMAGE: rust:1-alpine
+  BINARIES: homarr-server homarr homarr-workshop
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: write # upload release assets
+      packages: write # push to GHCR
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid tag: $RELEASE_TAG" >&2; exit 1
+          fi
+          prerelease=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
+          {
+            echo "version=${RELEASE_TAG#v}"
+            echo "prerelease=$prerelease"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .ci-cache/registry
+            .ci-cache/target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-
+
+      - name: Build static binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-cache/registry .ci-cache/target
+          docker run --rm \
+            -v "$PWD":/src -w /src \
+            -v "$PWD/.ci-cache/registry":/usr/local/cargo/registry \
+            -e CARGO_TARGET_DIR=/src/.ci-cache/target \
+            -e CARGO_PROFILE_RELEASE_LTO=true \
+            -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+            -e CARGO_PROFILE_RELEASE_STRIP=true \
+            -e TARGET -e BINARIES -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            "$RUST_IMAGE" sh -euc '
+              apk add --no-cache musl-dev pkgconfig >/dev/null
+              rustc -vV
+              bins=""; for b in $BINARIES; do bins="$bins --bin $b"; done
+              cargo build --release --locked --target "$TARGET" $bins
+              chown -R "$HOST_UID:$HOST_GID" /src/.ci-cache
+            '
+          out=".ci-cache/target/$TARGET/release"
+          for b in $BINARIES; do
+            file "$out/$b"
+            ls -lh "$out/$b"
+            if readelf -l "$out/$b" | grep -q INTERP; then
+              echo "Error: $b must be statically linked (found PT_INTERP)" >&2
+              exit 1
+            fi
+          done
+
+      - name: Package release tarball
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="homarr-${VERSION}-linux-${ARCH}"
+          stage="dist/$name"
+          mkdir -p "$stage/bin"
+          for b in $BINARIES; do cp ".ci-cache/target/$TARGET/release/$b" "$stage/bin/"; done
+          cp -r assets "$stage/assets"
+          cp LICENSE README.md "$stage/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
+          echo "tarball=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload tarball to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: gh release upload "$RELEASE_TAG" "$TARBALL" "$TARBALL.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push ${{ matrix.arch }} image
+        env:
+          ARCH: ${{ matrix.arch }}
+          STAGE: ${{ steps.package.outputs.stage }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tags=(-t "$IMAGE:$VERSION-$ARCH")
+          if [[ "$PRERELEASE" != "true" ]]; then tags+=(-t "$IMAGE:latest-$ARCH"); fi
+          docker buildx build \
+            --platform "linux/$ARCH" \
+            --provenance=false \
+            -f docker/Dockerfile.release \
+            "${tags[@]}" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            --push \
+            "$STAGE"
+          docker image ls "$IMAGE" || true
+
+  manifest:
+    name: Multi-arch manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
+          {
+            echo "version=${RELEASE_TAG#v}"
+            echo "prerelease=$prerelease"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create and push manifest
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tags=(-t "$IMAGE:$VERSION")
+          if [[ "$PRERELEASE" != "true" ]]; then tags+=(-t "$IMAGE:latest"); fi
+          docker buildx imagetools create "${tags[@]}" \
+            "$IMAGE:$VERSION-amd64" \
+            "$IMAGE:$VERSION-arm64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"

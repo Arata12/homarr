@@ -1,5 +1,7 @@
+use axum::http::HeaderMap;
 use chrono::Utc;
 use homarr_common::{generate_secure_random_token, HomarrResult};
+use homarr_core::AppConfig;
 use homarr_db::{repos, Database};
 
 use crate::permissions::AuthSession;
@@ -14,7 +16,10 @@ pub async fn create_session(
     ttl_seconds: i64,
 ) -> HomarrResult<String> {
     let token = generate_secure_random_token(48);
-    let expires_ms = Utc::now().timestamp_millis() + ttl_seconds * 1000;
+    let clamped_ttl = ttl_seconds.clamp(1, 365 * 10 * 86_400);
+    let expires_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_add(clamped_ttl.saturating_mul(1000));
     repos::sessions::create(db, &token, user_id, expires_ms).await?;
     Ok(token)
 }
@@ -52,16 +57,67 @@ pub async fn delete_session(db: &Database, token: &str) -> HomarrResult<()> {
     repos::sessions::delete_by_token(db, token).await
 }
 
-pub fn build_session_cookie(cookie_prefix: &str, token: String, max_age_secs: i64) -> String {
+/// Decides whether the session cookie should carry `Secure`: explicit `AUTH_COOKIE_SECURE`
+/// override first, then `X-Forwarded-Proto`, then an `https://` `BASE_URL`. Plain HTTP stays
+/// usable by default.
+pub fn cookie_secure(config: &AppConfig, headers: &HeaderMap) -> bool {
+    if let Some(explicit) = config.auth_cookie_secure {
+        return explicit;
+    }
+    if let Some(proto) = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
+        return proto
+            .split(',')
+            .next()
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"));
+    }
+    config
+        .base_url
+        .as_deref()
+        .is_some_and(|u| u.to_ascii_lowercase().starts_with("https://"))
+}
+
+pub fn build_session_cookie(
+    cookie_prefix: &str,
+    token: String,
+    max_age_secs: i64,
+    secure: bool,
+) -> String {
+    let secure = if secure { "; Secure" } else { "" };
     format!(
-        "{}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}",
+        "{}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{secure}",
         session_cookie_name(cookie_prefix)
     )
 }
 
-pub fn build_clear_session_cookie(cookie_prefix: &str) -> String {
+pub fn build_clear_session_cookie(cookie_prefix: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
     format!(
-        "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+        "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
         session_cookie_name(cookie_prefix)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_flag_decision() {
+        let mut cfg = AppConfig::for_test();
+        let mut h = HeaderMap::new();
+        assert!(!cookie_secure(&cfg, &h));
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(cookie_secure(&cfg, &h));
+        h.insert("x-forwarded-proto", "http".parse().unwrap());
+        cfg.base_url = Some("https://homarr.example".into());
+        assert!(!cookie_secure(&cfg, &h));
+        assert!(cookie_secure(&cfg, &HeaderMap::new()));
+        cfg.auth_cookie_secure = Some(false);
+        assert!(!cookie_secure(&cfg, &HeaderMap::new()));
+        assert!(build_session_cookie("homarr", "t".into(), 5, true).ends_with("; Secure"));
+        assert!(!build_clear_session_cookie("homarr", false).contains("Secure"));
+    }
 }

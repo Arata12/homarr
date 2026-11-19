@@ -102,3 +102,23 @@ pub const INFO: &str = tabler_svg!(
 pub const BOOK: &str = tabler_svg!(
     r#"<path d="M3 19a9 9 0 0 1 9 0a9 9 0 0 1 9 0" /><path d="M3 6a9 9 0 0 1 9 0a9 9 0 0 1 9 0" /><path d="M3 6l0 13" /><path d="M12 6l0 13" /><path d="M21 6l0 13" />"#
 );
+pub const COPY: &str = tabler_svg!(
+    r#"<path d="M7 7m0 2.667a2.667 2.667 0 0 1 2.667 -2.667h8.666a2.667 2.667 0 0 1 2.667 2.667v8.666a2.667 2.667 0 0 1 -2.667 2.667h-8.666a2.667 2.667 0 0 1 -2.667 -2.667z" /><path d="M4.012 16.737a2.005 2.005 0 0 1 -1.012 -1.737v-10c0 -1.1 .9 -2 2 -2h10c.75 0 1.158 .385 1.5 1" />"#
+);
+pub const ARROW_UP: &str =
+    tabler_svg!(r#"<path d="M12 5l0 14" /><path d="M18 11l-6 -6" /><path d="M6 11l6 -6" />"#);
+pub const ARROW_DOWN: &str =
+    tabler_svg!(r#"<path d="M12 5l0 14" /><path d="M18 13l-6 6" /><path d="M6 13l6 6" />"#);
+pub const GRIP: &str = tabler_svg!(
+    r#"<path d="M9 5m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" /><path d="M9 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" /><path d="M9 19m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" /><path d="M15 5m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" /><path d="M15 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" /><path d="M15 19m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" />"#
+);
+pub const EYE: &str = tabler_svg!(
+    r#"<path d="M10 12a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" /><path d="M21 12c-2.4 4 -5.4 6 -9 6c-3.6 0 -6.6 -2 -9 -6c2.4 -4 5.4 -6 9 -6c3.6 0 6.6 2 9 6" />"#
+);
+pub const EYE_OFF: &str = tabler_svg!(
+    r#"<path d="M10.585 10.587a2 2 0 0 0 2.829 2.828" /><path d="M16.681 16.673a8.717 8.717 0 0 1 -4.681 1.327c-3.6 0 -6.6 -2 -9 -6c1.272 -2.12 2.712 -3.678 4.32 -4.674m2.86 -1.146a9.055 9.055 0 0 1 1.82 -.18c3.6 0 6.6 2 9 6c-.666 1.11 -1.379 2.067 -2.138 2.87" /><path d="M3 3l18 18" />"#
+);
+pub const MENU: &str =
+    tabler_svg!(r#"<path d="M4 6l16 0" /><path d="M4 12l16 0" /><path d="M4 18l16 0" />"#);
+pub const ARROW_UP_RIGHT: &str =
+    tabler_svg!(r#"<path d="M17 7l-10 10" /><path d="M8 7l9 0l0 9" />"#);

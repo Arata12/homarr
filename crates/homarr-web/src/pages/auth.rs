@@ -8,7 +8,7 @@ use homarr_db::repos::{boards, users};
 use html_escape::encode_text;
 
 use crate::icons;
-use crate::layout::{render_page, PageContext};
+use crate::layout::{render_page, PageContext, ServerUiSettings};
 use crate::WebState;
 
 fn wrap_auth_shell(heading: &str, subtitle: &str, inner: &str) -> String {
@@ -64,11 +64,15 @@ pub async fn login_page(
   </div>
   <div class="form-row">
     <label for="password">Password</label>
-    <input id="password" name="password" type="password" placeholder="••••••••" required />
+    <div class="password-wrap">
+      <input id="password" name="password" type="password" placeholder="••••••••" required />
+      <button type="button" class="password-toggle" data-toggle-password aria-label="Toggle password visibility">{eye}</button>
+    </div>
   </div>
   <button type="submit" class="btn btn-primary btn-full" style="margin-top:4px">{user_icon}<span>Sign In</span></button>
 </form>"#,
         user_icon = icons::USER,
+        eye = icons::EYE,
     );
 
     let body = wrap_auth_shell(
@@ -77,7 +81,8 @@ pub async fn login_page(
         &inner,
     );
 
-    Html(render_page(PageContext {
+    let ui = ServerUiSettings::load(&state.db).await;
+    let mut ctx = PageContext {
         session: session.as_ref(),
         demo_mode: state.config.demo_mode,
         demo_read_only: state.config.demo_read_only,
@@ -86,7 +91,9 @@ pub async fn login_page(
         opacity: Some(88),
         hide_header: true,
         ..PageContext::minimal("Sign In", &body, &locale, &web.i18n)
-    }))
+    };
+    ui.apply(&mut ctx);
+    Html(render_page(ctx))
 }
 
 pub async fn invite_page(
@@ -124,7 +131,8 @@ pub async fn invite_page(
         &inner,
     );
 
-    Html(render_page(PageContext {
+    let ui = ServerUiSettings::load(&state.db).await;
+    let mut ctx = PageContext {
         session: session.as_ref(),
         demo_mode: state.config.demo_mode,
         demo_read_only: state.config.demo_read_only,
@@ -132,7 +140,9 @@ pub async fn invite_page(
         opacity: Some(88),
         hide_header: true,
         ..PageContext::minimal("Register", &body, &locale, &web.i18n)
-    }))
+    };
+    ui.apply(&mut ctx);
+    Html(render_page(ctx))
 }
 
 pub async fn onboarding_page(
@@ -148,29 +158,39 @@ pub async fn onboarding_page(
         .t(&locale, "init.studio.welcome.title", "Welcome home.");
 
     let account_step = if user_count == 0 {
-        r#"<div class="init-step-box">
-  <h3>Create Administrator</h3>
-  <p class="muted" style="margin-top:0;font-size:.86rem">Set up your first administrator account to launch Homarr.</p>
+        format!(
+            r#"<div class="init-step-box">
+  <h3>1. Administrator Credentials</h3>
+  <p class="muted" style="margin-top:0;font-size:.86rem">Set up your first administrator account and workspace defaults.</p>
   <form class="form-grid" style="max-width:none" data-api-form="/api/auth/register" data-redirect="/">
     <div class="form-row"><label>Username</label><input name="name" required minlength="2" placeholder="admin" /></div>
-    <div class="form-row"><label>Email</label><input name="email" type="email" placeholder="admin@homarr.local" /></div>
-    <div class="form-row"><label>Password</label><input name="password" type="password" required minlength="8" /></div>
-    <button type="submit" class="btn btn-primary btn-full">Create Administrator &amp; Launch</button>
+    <div class="form-row"><label>Email (optional)</label><input name="email" type="email" placeholder="admin@homarr.local" /></div>
+    <div class="form-row">
+      <label>Password</label>
+      <div class="password-wrap">
+        <input name="password" type="password" required minlength="8" placeholder="At least 8 characters" />
+        <button type="button" class="password-toggle" data-toggle-password aria-label="Toggle password visibility">{eye}</button>
+      </div>
+    </div>
+    <div class="init-divider"></div>
+    <h3 style="margin-bottom:4px">2. Initial Workspace Defaults</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="form-row"><label>First Board Name</label><input name="boardName" value="dashboard" pattern="[A-Za-z0-9_\-]+" /></div>
+      <div class="form-row"><label>Color Scheme</label><select name="colorScheme"><option value="dark" selected>Dark</option><option value="light">Light</option></select></div>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;font-weight:500"><input type="checkbox" name="createStarterBoard" style="width:auto" checked /> Create starter board with useful apps &amp; widgets</label>
+    <button type="submit" class="btn btn-primary btn-full">Create Administrator &amp; Build Board</button>
   </form>
-</div>"#
+</div>
+<p class="muted" style="font-size:.8rem;text-align:center;margin:0">Have an existing backup? Create your administrator account first, then import it under <strong>Manage &rarr; Backup &amp; Restore</strong>.</p>"#,
+            eye = icons::EYE,
+        )
     } else {
         r#"<div class="init-step-box">
   <h3>Workspace Ready</h3>
   <p class="muted" style="margin-top:0;font-size:.86rem">Your administrator account is configured.</p>
   <a class="btn btn-primary btn-full" href="/">Open Home Board</a>
-</div>"#
-    };
-
-    let inner = format!(
-        r#"<div style="display:flex;justify-content:center;margin-bottom:14px">
-  <span class="demo-pill">Homarr v{version}</span>
 </div>
-{account_step}
 <div class="init-checklist">
   <div class="muted" style="font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Quick Setup</div>
   <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -179,7 +199,14 @@ pub async fn onboarding_page(
     <a class="btn btn-sm" href="/manage/integrations">Integrations</a>
     <a class="btn btn-sm" href="/manage/settings">Settings</a>
   </div>
-</div>"#,
+</div>"#.to_string()
+    };
+
+    let inner = format!(
+        r#"<div style="display:flex;justify-content:center;margin-bottom:14px">
+  <span class="demo-pill">Homarr v{version}</span>
+</div>
+{account_step}"#,
         version = env!("CARGO_PKG_VERSION"),
     );
 
@@ -189,7 +216,8 @@ pub async fn onboarding_page(
         &inner,
     );
 
-    Html(render_page(PageContext {
+    let ui = ServerUiSettings::load(&state.db).await;
+    let mut ctx = PageContext {
         session: session.as_ref(),
         demo_mode: state.config.demo_mode,
         demo_read_only: state.config.demo_read_only,
@@ -197,7 +225,9 @@ pub async fn onboarding_page(
         opacity: Some(88),
         hide_header: true,
         ..PageContext::minimal("Onboarding", &body, &locale, &web.i18n)
-    }))
+    };
+    ui.apply(&mut ctx);
+    Html(render_page(ctx))
 }
 
 pub async fn mcp_auth_page(
@@ -221,10 +251,13 @@ pub async fn mcp_auth_page(
   </div>
 </div>"#;
 
-    Html(render_page(PageContext {
+    let ui = ServerUiSettings::load(&state.db).await;
+    let mut ctx = PageContext {
         session: session.as_ref(),
         demo_mode: state.config.demo_mode,
         demo_read_only: state.config.demo_read_only,
         ..PageContext::minimal("MCP Setup", body, &locale, &web.i18n)
-    }))
+    };
+    ui.apply(&mut ctx);
+    Html(render_page(ctx))
 }

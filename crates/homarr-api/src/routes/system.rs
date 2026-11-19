@@ -32,7 +32,21 @@ pub async fn patch_settings(
 ) -> HomarrResult<Json<HashMap<String, Value>>> {
     admin.require_writable(state.demo_read_only_active())?;
     for (k, v) in patch {
-        settings::set_setting(&state.db, &k, &v).await?;
+        let merged = match v {
+            Value::Object(patch_obj) => {
+                let mut cur = settings::get_setting(&state.db, &k).await?;
+                if let Some(cur_obj) = cur.as_object_mut() {
+                    for (sub_k, sub_v) in patch_obj {
+                        cur_obj.insert(sub_k, sub_v);
+                    }
+                    cur
+                } else {
+                    Value::Object(patch_obj)
+                }
+            }
+            other => other,
+        };
+        settings::set_setting(&state.db, &k, &merged).await?;
     }
     let updated = settings::get_all_server_settings(&state.db).await?;
     Ok(Json(updated))

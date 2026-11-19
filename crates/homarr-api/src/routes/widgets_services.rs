@@ -6,10 +6,10 @@ use axum::{
     response::Html,
     Json,
 };
-use homarr_auth::{OptionalAuth, RequireAdmin, RequireAuth};
+use homarr_auth::{check_integration_permission, OptionalAuth, RequireAdmin, RequireAuth};
 use homarr_common::{HomarrError, HomarrResult};
 use homarr_db::repos::custom_widgets::{self as cw_repo, CustomWidgetV2Input};
-use homarr_definitions::WidgetKind;
+use homarr_definitions::{IntegrationPermission, WidgetKind};
 use homarr_services::validate_custom_widget_definition;
 use homarr_widgets::{all_widget_metadata, get_widget_metadata, render_widget_html};
 use serde::Deserialize;
@@ -29,7 +29,37 @@ pub struct RenderWidgetQuery {
     pub options: Option<String>,
 }
 
+async fn authorize_widget_integrations(
+    state: &AppState,
+    session: Option<&homarr_auth::AuthSession>,
+    kind: WidgetKind,
+    options: &Value,
+    integration_ids: &[String],
+) -> HomarrResult<()> {
+    let opt_int = options
+        .get("integrationId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let needs_auth =
+        !integration_ids.is_empty() || opt_int.is_some() || kind == WidgetKind::CustomApi;
+    if !needs_auth {
+        return Ok(());
+    }
+    let sess = session.ok_or_else(|| {
+        HomarrError::Unauthorized("Authentication required to query widget integrations".into())
+    })?;
+    for id in integration_ids {
+        check_integration_permission(&state.db, sess, id, IntegrationPermission::Use).await?;
+    }
+    if let Some(id) = opt_int {
+        check_integration_permission(&state.db, sess, id, IntegrationPermission::Use).await?;
+    }
+    Ok(())
+}
+
 pub async fn render_widget(
+    OptionalAuth(session): OptionalAuth,
     State(state): State<AppState>,
     Path(kind_str): Path<String>,
     Query(q): Query<RenderWidgetQuery>,
@@ -52,6 +82,8 @@ pub async fn render_widget(
                 .collect()
         })
         .unwrap_or_default();
+    authorize_widget_integrations(&state, session.as_ref(), kind, &options, &integration_ids)
+        .await?;
     let data = state
         .widgets
         .resolve_widget_data(kind, &options, &integration_ids)
@@ -71,12 +103,20 @@ pub struct ResolveWidgetBody {
 }
 
 pub async fn resolve_widget(
-    OptionalAuth(_session): OptionalAuth,
+    OptionalAuth(session): OptionalAuth,
     State(state): State<AppState>,
     Json(body): Json<ResolveWidgetBody>,
 ) -> HomarrResult<Json<Value>> {
     let kind = WidgetKind::from_str_opt(&body.kind)
         .ok_or_else(|| HomarrError::BadRequest(format!("Unknown widget kind '{}'", body.kind)))?;
+    authorize_widget_integrations(
+        &state,
+        session.as_ref(),
+        kind,
+        &body.options,
+        &body.integration_ids,
+    )
+    .await?;
     let data = state
         .widgets
         .resolve_widget_data(kind, &body.options, &body.integration_ids)

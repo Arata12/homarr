@@ -16,6 +16,7 @@ pub struct HttpClientFactory {
     standard: Client,
     no_redirect: Client,
     ping: Client,
+    certs: CertificateManager,
 }
 
 impl HttpClientFactory {
@@ -57,6 +58,7 @@ impl HttpClientFactory {
             standard,
             no_redirect,
             ping,
+            certs: certs.clone(),
         })
     }
 
@@ -64,8 +66,16 @@ impl HttpClientFactory {
         &self.standard
     }
 
+    pub fn no_redirect(&self) -> &Client {
+        &self.no_redirect
+    }
+
     pub fn ping(&self) -> &Client {
         &self.ping
+    }
+
+    pub fn certs(&self) -> &CertificateManager {
+        &self.certs
     }
 
     /// Requests a URL with SSRF protection (DNS lookup checked against blocked ranges

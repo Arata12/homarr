@@ -294,13 +294,20 @@ pub fn all_widget_kinds() -> &'static [WidgetKind] {
 
 pub fn widget_default_size(kind: WidgetKind) -> (i32, i32) {
     match kind {
+        WidgetKind::App => (1, 1),
         WidgetKind::Clock
         | WidgetKind::Weather
         | WidgetKind::AirQuality
         | WidgetKind::Countdown
-        | WidgetKind::Timer => (2, 1),
-        WidgetKind::Calendar
-        | WidgetKind::Bookmarks
+        | WidgetKind::Timer
+        | WidgetKind::StockPrice
+        | WidgetKind::MinecraftServerStatus
+        | WidgetKind::Releases
+        | WidgetKind::DnsHoleControls
+        | WidgetKind::NetworkControllerStatus
+        | WidgetKind::SmartHomeEntityState
+        | WidgetKind::SmartHomeExecuteAutomation => (2, 1),
+        WidgetKind::Bookmarks
         | WidgetKind::SmartHomeControls
         | WidgetKind::AudioStats
         | WidgetKind::PaperlessNgx
@@ -309,17 +316,48 @@ pub fn widget_default_size(kind: WidgetKind) -> (i32, i32) {
         | WidgetKind::Patchmon
         | WidgetKind::MediaRequestsRequestStats
         | WidgetKind::MediaMissing
-        | WidgetKind::Bazarr => (2, 2),
-        WidgetKind::CustomApi | WidgetKind::MediaServer | WidgetKind::MediaRequestsRequestList => {
-            (3, 2)
-        }
-        WidgetKind::Downloads => (4, 2),
+        | WidgetKind::Bazarr
+        | WidgetKind::Vpn
+        | WidgetKind::Ups => (2, 2),
+        WidgetKind::DnsHoleSummary
+        | WidgetKind::Notebook
+        | WidgetKind::AnchorNote
+        | WidgetKind::Calendar
+        | WidgetKind::CustomApi
+        | WidgetKind::MediaServer
+        | WidgetKind::MediaRequestsRequestList
+        | WidgetKind::MediaReleases
+        | WidgetKind::MediaTranscoding
+        | WidgetKind::HealthMonitoring
+        | WidgetKind::SystemResources
+        | WidgetKind::SystemDisks
+        | WidgetKind::Firewall
+        | WidgetKind::Traefik
+        | WidgetKind::NetworkControllerSummary
+        | WidgetKind::Notifications
+        | WidgetKind::RssFeed
+        | WidgetKind::Stats
+        | WidgetKind::SpeedtestTracker
+        | WidgetKind::ImmichServerStats
+        | WidgetKind::Umami
+        | WidgetKind::ArchiveTeamWarrior
+        | WidgetKind::Wud
+        | WidgetKind::Llamacpp
+        | WidgetKind::Coolify
+        | WidgetKind::Tracearr
+        | WidgetKind::BeszelAlerts
+        | WidgetKind::BeszelSystemStats
+        | WidgetKind::Timetable => (3, 2),
         WidgetKind::IndexerManager | WidgetKind::UptimeKuma => (2, 3),
         WidgetKind::ThingportModels => (3, 3),
+        WidgetKind::Downloads
+        | WidgetKind::DockerContainers
+        | WidgetKind::BeszelSystemTable
+        | WidgetKind::BeszelSystemGrid
+        | WidgetKind::ImmichAlbumCarousel => (4, 2),
+        WidgetKind::Iframe | WidgetKind::Video | WidgetKind::Wazuh => (4, 3),
         WidgetKind::ThingportActivityHeatmap => (6, 2),
         WidgetKind::Assistant => (10, 4),
-        WidgetKind::Wazuh => (4, 3),
-        _ => (1, 1),
     }
 }
 

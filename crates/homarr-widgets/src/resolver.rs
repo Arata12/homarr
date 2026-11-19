@@ -233,13 +233,17 @@ impl WidgetResolver {
             | W::Video
             | W::Timetable
             | W::Assistant => Ok(json!({ "options": options })),
-            _ => self.resolve_integration_widget(kind, integration_ids).await,
+            _ => {
+                self.resolve_integration_widget(kind, options, integration_ids)
+                    .await
+            }
         }
     }
 
     async fn resolve_integration_widget(
         &self,
         kind: WidgetKind,
+        options: &Value,
         integration_ids: &[String],
     ) -> HomarrResult<Value> {
         let contexts = self.load_integration_contexts(integration_ids).await?;
@@ -283,12 +287,14 @@ impl WidgetResolver {
                 Ok(summary) => Ok(json!({ "summary": summary })),
                 Err(e) => Ok(json!({ "error": e.to_string() })),
             },
-            W::MediaMissing | W::MediaReleases => {
-                match self.integrations.get_media_missing(first).await {
-                    Ok(items) => Ok(json!({ "items": items })),
-                    Err(e) => Ok(json!({ "error": e.to_string() })),
-                }
-            }
+            W::MediaMissing => match self.integrations.get_media_missing(first).await {
+                Ok(items) => Ok(json!({ "items": items })),
+                Err(e) => Ok(json!({ "error": e.to_string() })),
+            },
+            W::MediaReleases => match self.integrations.media_releases(first).await {
+                Ok(releases) => Ok(json!({ "releases": releases })),
+                Err(e) => Ok(json!({ "error": e.to_string() })),
+            },
             W::IndexerManager => match self.integrations.get_indexers(first).await {
                 Ok(indexers) => Ok(json!({ "indexers": indexers })),
                 Err(e) => Ok(json!({ "error": e.to_string() })),
@@ -330,16 +336,84 @@ impl WidgetResolver {
                 Ok(stats) => Ok(json!({ "stats": stats })),
                 Err(e) => Ok(json!({ "error": e.to_string() })),
             },
-            _ => {
-                let payload = self
-                    .integrations
-                    .get_generic_widget_data(first, kind.as_str())
-                    .await?;
+            W::Firewall => {
+                let (cpu, memory, interfaces, version) = tokio::join!(
+                    self.integrations.firewall_cpu(first),
+                    self.integrations.firewall_memory(first),
+                    self.integrations.firewall_interfaces(first),
+                    self.integrations.firewall_version(first),
+                );
+                if let (Err(err), Err(_), Err(_), Err(_)) = (&cpu, &memory, &interfaces, &version) {
+                    return Ok(json!({ "error": err.to_string() }));
+                }
                 Ok(json!({
                     "integrationName": first.name,
-                    "data": payload
+                    "cpu": cpu.ok(),
+                    "memory": memory.ok(),
+                    "interfaces": interfaces.ok(),
+                    "version": version.ok(),
                 }))
             }
+            W::Vpn => match self.integrations.vpn_summary(first).await {
+                Ok(vpn) => Ok(json!({ "integrationName": first.name, "vpn": vpn })),
+                Err(e) => Ok(json!({ "error": e.to_string() })),
+            },
+            W::Traefik => match self.integrations.traefik_dashboard(first).await {
+                Ok(traefik) => Ok(json!({ "integrationName": first.name, "traefik": traefik })),
+                Err(e) => Ok(json!({ "error": e.to_string() })),
+            },
+            W::NetworkControllerSummary | W::NetworkControllerStatus => {
+                match self.integrations.network_summary(first).await {
+                    Ok(network) => Ok(json!({ "integrationName": first.name, "network": network })),
+                    Err(e) => Ok(json!({ "error": e.to_string() })),
+                }
+            }
+            W::AnchorNote => {
+                let note_id = options
+                    .get("noteId")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let res = if let Some(id) = note_id {
+                    self.integrations
+                        .integration_data(first, "getNote", &json!({ "noteId": id }))
+                        .await
+                        .map(|note| json!({ "integrationName": first.name, "note": note }))
+                } else {
+                    self.integrations
+                        .integration_data(first, "listNotes", &json!({ "limit": 5 }))
+                        .await
+                        .map(|notes| json!({ "integrationName": first.name, "notes": notes }))
+                };
+                match res {
+                    Ok(val) => Ok(val),
+                    Err(e) => Ok(json!({ "error": e.to_string() })),
+                }
+            }
+            W::BeszelAlerts => {
+                let empty_input = json!({});
+                let (stats, alerts) = tokio::join!(
+                    self.integrations.get_stats(first),
+                    self.integrations
+                        .integration_data(first, "getAlerts", &empty_input),
+                );
+                match (stats, alerts) {
+                    (Ok(stats), alerts) => Ok(json!({
+                        "integrationName": first.name,
+                        "stats": stats,
+                        "alerts": alerts.ok(),
+                    })),
+                    (Err(_), Ok(alerts)) => Ok(json!({
+                        "integrationName": first.name,
+                        "alerts": alerts,
+                    })),
+                    (Err(e), Err(_)) => Ok(json!({ "error": e.to_string() })),
+                }
+            }
+            _ => match self.integrations.get_stats(first).await {
+                Ok(stats) => Ok(json!({ "integrationName": first.name, "stats": stats })),
+                Err(e) => Ok(json!({ "error": e.to_string() })),
+            },
         }
     }
 

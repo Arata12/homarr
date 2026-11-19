@@ -8,8 +8,9 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{PgPool, SqlitePool};
 
-const SQLITE_INITIAL_SQL: &str = include_str!("../../../migrations/sqlite/0001_initial.sql");
-const POSTGRES_INITIAL_SQL: &str = include_str!("../../../migrations/postgres/0001_initial.sql");
+// Tracked migrations (sqlx `_sqlx_migrations` table). See migrations/README.md.
+static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/sqlite");
+static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/postgres");
 
 #[derive(Clone)]
 pub enum Database {
@@ -74,18 +75,8 @@ impl Database {
 
     pub async fn migrate(&self) -> HomarrResult<()> {
         match self {
-            Self::Sqlite(pool) => {
-                sqlx::raw_sql(SQLITE_INITIAL_SQL)
-                    .execute(pool)
-                    .await
-                    .map_err(map_sqlx_err)?;
-            }
-            Self::Postgres(pool) => {
-                sqlx::raw_sql(POSTGRES_INITIAL_SQL)
-                    .execute(pool)
-                    .await
-                    .map_err(map_sqlx_err)?;
-            }
+            Self::Sqlite(pool) => SQLITE_MIGRATOR.run(pool).await.map_err(map_migrate_err)?,
+            Self::Postgres(pool) => POSTGRES_MIGRATOR.run(pool).await.map_err(map_migrate_err)?,
         }
         Ok(())
     }
@@ -119,6 +110,10 @@ fn normalize_sqlite_url(url: &str) -> String {
     } else {
         format!("sqlite://{trimmed}")
     }
+}
+
+fn map_migrate_err(err: sqlx::migrate::MigrateError) -> HomarrError {
+    HomarrError::Database(format!("Migration failed: {err}"))
 }
 
 pub fn map_sqlx_err(err: sqlx::Error) -> HomarrError {

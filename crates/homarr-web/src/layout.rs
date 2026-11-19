@@ -1,11 +1,177 @@
+use homarr_api::AppState;
 use homarr_auth::AuthSession;
 use homarr_db::models::BoardRecord;
+use homarr_db::repos::{apps, search_engines, settings};
+use homarr_db::Database;
+use homarr_definitions::settings::parse_branding_settings;
 use homarr_widgets::safe_url;
-use html_escape::encode_text;
-use serde_json::Value;
+use html_escape::{encode_double_quoted_attribute as encode_attr, encode_text};
+use serde_json::{json, Value};
 
 use crate::i18n::I18nCatalog;
 use crate::icons;
+use crate::pages::board_editor::script_json;
+
+pub struct ServerUiSettings {
+    pub app_name: String,
+    pub default_color_scheme: String,
+    pub logo_image_url: Option<String>,
+    pub favicon_image_url: Option<String>,
+    pub robots_meta: String,
+}
+
+impl ServerUiSettings {
+    pub async fn load(db: &Database) -> Self {
+        let raw = settings::get_all_server_settings(db)
+            .await
+            .unwrap_or_default();
+        let branding = raw
+            .get("branding")
+            .map(parse_branding_settings)
+            .unwrap_or_default();
+        let scheme = raw
+            .get("appearance")
+            .and_then(|v| v.get("defaultColorScheme"))
+            .and_then(Value::as_str)
+            .unwrap_or("dark")
+            .to_ascii_lowercase();
+        let crawl = raw.get("crawlingAndIndexing");
+        let mut robots = Vec::new();
+        if crawl
+            .and_then(|v| v.get("noIndex"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            robots.push("noindex");
+        }
+        if crawl
+            .and_then(|v| v.get("noFollow"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            robots.push("nofollow");
+        }
+        if crawl
+            .and_then(|v| v.get("noTranslate"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            robots.push("notranslate");
+        }
+        Self {
+            app_name: branding.app_name,
+            default_color_scheme: if scheme == "light" {
+                "light".to_string()
+            } else {
+                "dark".to_string()
+            },
+            logo_image_url: branding.logo_image_url.filter(|s| !s.trim().is_empty()),
+            favicon_image_url: branding.favicon_image_url.filter(|s| !s.trim().is_empty()),
+            robots_meta: robots.join(", "),
+        }
+    }
+
+    pub fn apply<'a>(&'a self, ctx: &mut PageContext<'a>) {
+        ctx.app_name = Some(&self.app_name);
+        ctx.default_color_scheme = Some(&self.default_color_scheme);
+        if ctx.logo_image_url.is_none() {
+            ctx.logo_image_url = self.logo_image_url.as_deref();
+        }
+        if ctx.favicon_image_url.is_none() {
+            ctx.favicon_image_url = self.favicon_image_url.as_deref();
+        }
+        if !self.robots_meta.is_empty() {
+            ctx.robots_meta = Some(&self.robots_meta);
+        }
+    }
+}
+
+pub(crate) async fn build_spotlight_items(
+    state: &AppState,
+    visible_boards: &[BoardRecord],
+    is_admin: bool,
+    can_edit_board: bool,
+) -> Vec<Value> {
+    let mut items = Vec::new();
+    for b in visible_boards {
+        items.push(json!({
+            "label": b.name,
+            "sub": "Board",
+            "category": "Boards",
+            "href": format!("/boards/{}", urlencoding(&b.name)),
+        }));
+    }
+    for app in apps::list_all(&state.db).await.unwrap_or_default() {
+        let href = app.href.as_deref().map(safe_url).unwrap_or("#").to_string();
+        items.push(json!({
+            "label": app.name,
+            "sub": app.description.unwrap_or_else(|| "Application".to_string()),
+            "category": "Apps",
+            "href": href,
+        }));
+    }
+    for se in search_engines::list_all(&state.db)
+        .await
+        .unwrap_or_default()
+    {
+        let href = se
+            .url_template
+            .as_deref()
+            .map(safe_url)
+            .filter(|u| *u != "#")
+            .unwrap_or("https://duckduckgo.com")
+            .to_string();
+        items.push(json!({
+            "label": format!("!{} ({})", se.short, se.name),
+            "sub": "Search Engine",
+            "category": "Web",
+            "href": href,
+        }));
+    }
+    items.push(json!({
+        "label": "Toggle Color Scheme",
+        "sub": "Switch dark / light theme",
+        "category": "Actions",
+        "action": "toggle-theme",
+    }));
+    if can_edit_board {
+        items.push(json!({
+            "label": "Toggle Edit Mode",
+            "sub": "Edit board layout and widgets",
+            "category": "Actions",
+            "action": "edit-board",
+        }));
+    }
+    items.push(json!({ "label": "Home Board", "sub": "Board", "category": "Boards", "href": "/" }));
+    if is_admin {
+        for (label, href) in [
+            ("Manage Overview", "/manage"),
+            ("Manage Boards", "/manage/boards"),
+            ("Manage Apps", "/manage/apps"),
+            ("Manage Integrations", "/manage/integrations"),
+            ("Manage Search Engines", "/manage/search-engines"),
+            ("Manage Custom Widgets", "/manage/custom-widgets"),
+            ("Server Settings", "/manage/settings"),
+            ("Manage Users", "/manage/users"),
+            ("Manage Groups", "/manage/users/groups"),
+            ("Manage Invites", "/manage/users/invites"),
+            ("Docker Containers", "/manage/tools/docker"),
+            ("Cron Tasks", "/manage/tools/tasks"),
+            ("Server Logs", "/manage/tools/logs"),
+            ("Certificates", "/manage/tools/certificates"),
+            ("API Keys", "/manage/tools/api-keys"),
+            ("Backup & Restore", "/manage/tools/backup"),
+            ("AI Assistant", "/manage/assistant"),
+            ("About Homarr", "/manage/about"),
+        ] {
+            items.push(
+                json!({ "label": label, "sub": "Manage", "category": "Pages", "href": href }),
+            );
+        }
+    }
+    items.push(json!({ "label": "API Reference", "sub": "OpenAPI & MCP", "category": "Pages", "href": "/reference/api" }));
+    items
+}
 
 pub struct PageContext<'a> {
     pub title: &'a str,
@@ -32,6 +198,9 @@ pub struct PageContext<'a> {
     pub can_edit_board: bool,
     pub is_board_page: bool,
     pub hide_header: bool,
+    pub app_name: Option<&'a str>,
+    pub default_color_scheme: Option<&'a str>,
+    pub robots_meta: Option<&'a str>,
 }
 
 impl<'a> PageContext<'a> {
@@ -61,6 +230,9 @@ impl<'a> PageContext<'a> {
             can_edit_board: false,
             is_board_page: false,
             hide_header: false,
+            app_name: None,
+            default_color_scheme: None,
+            robots_meta: None,
         }
     }
 }
@@ -148,7 +320,7 @@ fn sanitize_bg_size(raw: Option<&str>) -> &'static str {
     }
 }
 
-fn urlencoding(raw: &str) -> String {
+pub(crate) fn urlencoding(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for b in raw.bytes() {
         match b {
@@ -162,16 +334,28 @@ fn urlencoding(raw: &str) -> String {
 }
 
 pub fn render_page(ctx: PageContext<'_>) -> String {
+    let fallback_theme = match ctx.default_color_scheme {
+        Some("light") => "light",
+        _ => "dark",
+    };
     let theme = ctx
         .session
-        .map(|s| {
-            if s.color_scheme == "light" {
-                "light"
-            } else {
-                "dark"
-            }
+        .map(|s| match s.color_scheme.as_str() {
+            "light" => "light",
+            "dark" => "dark",
+            _ => fallback_theme,
         })
-        .unwrap_or("dark");
+        .unwrap_or(fallback_theme);
+    let brand_name = encode_text(
+        ctx.app_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Homarr"),
+    );
+    let robots_tag = match ctx.robots_meta.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => format!(r#"<meta name="robots" content="{}" />"#, encode_attr(r)),
+        None => String::new(),
+    };
 
     let custom_style = {
         let mut s = String::new();
@@ -212,7 +396,7 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
             let size = sanitize_bg_size(ctx.background_image_size);
             format!(
                 r#"<div class="board-bg-layer" style="background-image:url('{}');background-attachment:{attach};background-repeat:{repeat};background-size:{size}" aria-hidden="true"></div>"#,
-                encode_text(&bg_url)
+                encode_attr(&bg_url)
             )
         }
         None => String::new(),
@@ -223,7 +407,7 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
         let selected = if code == ctx.locale { " selected" } else { "" };
         locale_select_opts.push_str(&format!(
             r#"<option value="{}"{selected}>{}</option>"#,
-            encode_text(code),
+            encode_attr(code),
             encode_text(code)
         ));
     }
@@ -395,15 +579,15 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
   <div class="header-content">
     <div class="header-zone header-zone-left">
       <a class="brand" href="/">
-        <img class="brand-logo" src="{logo_src}" alt="Homarr" />
-        <span class="brand-name">Homarr</span>
+        <img class="brand-logo" src="{logo_src}" alt="{brand_name}" />
+        <span class="brand-name">{brand_name}</span>
       </a>
       {demo_badge}
       {board_switcher}
     </div>
     <div class="header-zone header-zone-center">
       <button type="button" class="spotlight-trigger" onclick="window.openSpotlight()" aria-label="Search boards and apps">
-        <span class="spotlight-trigger-inner">{search_icon}<span>Search boards, apps, or web...</span></span>
+        <span class="spotlight-trigger-inner">{search_icon}<span class="spotlight-placeholder">Search boards, apps, or web...</span></span>
         <span class="kbd">Ctrl K</span>
       </button>
     </div>
@@ -416,7 +600,7 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
     </div>
   </div>
 </header>"#,
-            logo_src = encode_text(&logo_src),
+            logo_src = encode_attr(&logo_src),
             search_icon = icons::SEARCH,
             theme_icon = icons::SUN_MOON,
         )
@@ -436,9 +620,7 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
         ""
     };
 
-    let spotlight_script_json = serde_json::to_string(ctx.spotlight_items)
-        .unwrap_or_else(|_| "[]".to_string())
-        .replace("</", "<\\/");
+    let spotlight_script_json = script_json(&Value::Array(ctx.spotlight_items.to_vec()));
 
     format!(
         r#"<!doctype html>
@@ -446,7 +628,8 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title} — Homarr</title>
+  {robots_tag}
+  <title>{title} — {brand_name}</title>
   <link rel="icon" href="{favicon}" />
   <link rel="stylesheet" href="/static/homarr.css" />
   {custom_style}
@@ -463,8 +646,16 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
     <div class="modal-card spotlight-card">
       <div class="spotlight-input-row">
         {search_icon}
-        <input id="spotlight-input" type="search" placeholder="Search boards, apps, integrations, or web..." autocomplete="off" />
+        <input id="spotlight-input" type="search" placeholder="Search boards, apps, pages, or actions..." autocomplete="off" />
         <button type="button" class="icon-btn icon-btn-sm" onclick="window.closeSpotlight()" aria-label="Close search">{close_icon}</button>
+      </div>
+      <div class="spotlight-tabs" role="tablist" aria-label="Filter results">
+        <button type="button" class="spotlight-tab is-active" data-spotlight-cat="all">All</button>
+        <button type="button" class="spotlight-tab" data-spotlight-cat="Apps">Apps</button>
+        <button type="button" class="spotlight-tab" data-spotlight-cat="Boards">Boards</button>
+        <button type="button" class="spotlight-tab" data-spotlight-cat="Pages">Pages</button>
+        <button type="button" class="spotlight-tab" data-spotlight-cat="Actions">Actions</button>
+        <button type="button" class="spotlight-tab" data-spotlight-cat="Web">Web</button>
       </div>
       <div id="spotlight-results" class="spotlight-results"></div>
       <div class="spotlight-footer">
@@ -478,12 +669,18 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
   <div id="toast-stack" class="toast-stack"></div>
   <script>window.__HOMARR_SPOTLIGHT__ = {spotlight_script_json};</script>
   <script src="/static/homarr.js" defer></script>
+  {editor_script_tag}
 </body>
 </html>"#,
-        lang = encode_text(ctx.locale),
+        lang = encode_attr(ctx.locale),
         title = encode_text(ctx.title),
-        favicon = encode_text(&favicon_href),
+        favicon = encode_attr(&favicon_href),
         body = ctx.body,
+        editor_script_tag = if ctx.can_edit_board {
+            r#"<script src="/static/board-editor.js" defer></script>"#
+        } else {
+            ""
+        },
         search_icon = icons::SEARCH,
         close_icon = icons::X,
     )

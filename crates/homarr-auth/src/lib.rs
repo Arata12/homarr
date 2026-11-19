@@ -11,8 +11,8 @@ pub use permissions::{
     can_view_board, check_board_permission, check_integration_permission, AuthSession,
 };
 pub use session::{
-    build_clear_session_cookie, build_session_cookie, create_session, delete_session,
-    get_session_from_token, session_cookie_name,
+    build_clear_session_cookie, build_session_cookie, cookie_secure, create_session,
+    delete_session, get_session_from_token, session_cookie_name,
 };
 
 #[cfg(test)]

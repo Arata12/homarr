@@ -5,14 +5,20 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Request, State,
     },
-    http::{header::COOKIE, HeaderMap, StatusCode},
+    http::{
+        header::{COOKIE, ORIGIN},
+        HeaderMap, StatusCode,
+    },
     middleware::Next,
     response::IntoResponse,
 };
 use homarr_auth::{get_session_from_token, session_cookie_name, API_KEY_HEADER_NAME};
 use serde_json::json;
 
-use crate::state::AppState;
+use crate::{
+    csrf::{has_session_cookie, has_valid_same_origin},
+    state::AppState,
+};
 
 /// Middleware rejecting WebSocket requests carrying an `ApiKey` header BEFORE upgrade extraction.
 pub async fn reject_api_key_middleware(req: Request, next: Next) -> impl IntoResponse {
@@ -41,10 +47,28 @@ pub async fn ws_handler(
     }
 
     let cookie_name = session_cookie_name(&state.config.auth_cookie_prefix);
+    let has_cookie = has_session_cookie(&headers, &cookie_name);
+    let has_proxy_auth = state
+        .config
+        .auth_trusted_proxy_header
+        .as_deref()
+        .is_some_and(|h| headers.contains_key(h));
+
+    if (headers.contains_key(ORIGIN) || has_cookie || has_proxy_auth)
+        && !has_valid_same_origin(&headers, state.config.base_url.as_deref())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "Cross-origin WebSocket connection rejected",
+        )
+            .into_response();
+    }
+
     let session_token = headers
-        .get(COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|hdr| {
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|hdr| {
             hdr.split(';').find_map(|part| {
                 let (k, v) = part.trim().split_once('=')?;
                 if k.trim() == cookie_name {

@@ -14,7 +14,13 @@ use homarr_db::{
 use homarr_definitions::{
     integration::all_integration_defs, GroupPermissionKey, IntegrationKind, IntegrationPermission,
 };
-use homarr_integrations::IntegrationContext;
+use homarr_integrations::{
+    capabilities::{
+        downloads::{DownloadClientItem, DownloadClientSelection},
+        smart_home::SmartHomeAction,
+    },
+    IntegrationContext,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -227,6 +233,283 @@ pub async fn get_integration_data(
     let ctx = load_ctx(&state, &id).await?;
     let stats = state.integrations.get_stats(&ctx).await?;
     Ok(Json(serde_json::to_value(stats).unwrap_or_default()))
+}
+
+pub async fn get_integration_stats(
+    RequireAuth(session): RequireAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> HomarrResult<Json<Value>> {
+    check_integration_permission(&state.db, &session, &id, IntegrationPermission::Use).await?;
+    let ctx = load_ctx(&state, &id).await?;
+    let metrics = state.integrations.stats_metrics(ctx.kind);
+    if !metrics.is_empty() {
+        let values = state.integrations.stats_values(&ctx).await?;
+        let legacy = state.integrations.format_stats(&ctx, &metrics, &values);
+        return Ok(Json(json!({
+            "metrics": metrics,
+            "values": values,
+            "legacy": legacy,
+        })));
+    }
+    let legacy = state.integrations.get_stats(&ctx).await?;
+    Ok(Json(json!({
+        "metrics": [],
+        "values": {},
+        "legacy": legacy,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationQueryBody {
+    pub capability: String,
+    #[serde(default)]
+    pub operation: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
+}
+
+fn is_mutating_integration_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "deleteNotification"
+            | "updateNote"
+            | "updateAlert"
+            | "deleteAlert"
+            | "pauseSystem"
+            | "resumeSystem"
+            | "deleteSystem"
+    )
+}
+
+pub async fn query_integration(
+    RequireAuth(session): RequireAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<IntegrationQueryBody>,
+) -> HomarrResult<Json<Value>> {
+    check_integration_permission(&state.db, &session, &id, IntegrationPermission::Use).await?;
+    let ctx = load_ctx(&state, &id).await?;
+    let input = body.input.unwrap_or(Value::Null);
+    let data = match body.capability.trim() {
+        "firewall" => match body.operation.as_deref() {
+            Some("cpu") => to_json_val(state.integrations.firewall_cpu(&ctx).await?),
+            Some("memory") => to_json_val(state.integrations.firewall_memory(&ctx).await?),
+            Some("interfaces") => to_json_val(state.integrations.firewall_interfaces(&ctx).await?),
+            Some("version") => to_json_val(state.integrations.firewall_version(&ctx).await?),
+            None | Some("all") => {
+                let (cpu, memory, interfaces, version) = tokio::try_join!(
+                    state.integrations.firewall_cpu(&ctx),
+                    state.integrations.firewall_memory(&ctx),
+                    state.integrations.firewall_interfaces(&ctx),
+                    state.integrations.firewall_version(&ctx),
+                )?;
+                json!({
+                    "cpu": cpu,
+                    "memory": memory,
+                    "interfaces": interfaces,
+                    "version": version,
+                })
+            }
+            Some(op) => {
+                return Err(HomarrError::BadRequest(format!(
+                    "Unknown firewall operation '{op}'"
+                )))
+            }
+        },
+        "vpn" => to_json_val(state.integrations.vpn_summary(&ctx).await?),
+        "traefik" => to_json_val(state.integrations.traefik_dashboard(&ctx).await?),
+        "network" => to_json_val(state.integrations.network_summary(&ctx).await?),
+        "downloads" => {
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(50)
+                .clamp(1, 200) as usize;
+            let selection: Option<DownloadClientSelection> = input
+                .get("selection")
+                .cloned()
+                .filter(|v| !v.is_null())
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|err| HomarrError::BadRequest(format!("Invalid selection: {err}")))?;
+            to_json_val(
+                state
+                    .integrations
+                    .downloads_jobs_and_status(&ctx, limit, selection.as_ref())
+                    .await?,
+            )
+        }
+        "mediaReleases" => to_json_val(state.integrations.media_releases(&ctx).await?),
+        "stats" => {
+            let metrics = state.integrations.stats_metrics(ctx.kind);
+            let values = state.integrations.stats_values(&ctx).await?;
+            json!({ "metrics": metrics, "values": values })
+        }
+        "integrationData" => {
+            let operation = body
+                .operation
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    HomarrError::BadRequest("operation is required for integrationData".into())
+                })?;
+            if is_mutating_integration_operation(operation) {
+                return Err(HomarrError::Forbidden(
+                    "Mutating operations require the actions endpoint".into(),
+                ));
+            }
+            state
+                .integrations
+                .integration_data(&ctx, operation, &input)
+                .await?
+        }
+        other => {
+            return Err(HomarrError::BadRequest(format!(
+                "Unsupported query capability '{other}'"
+            )))
+        }
+    };
+    Ok(Json(json!({ "data": data })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationActionBody {
+    pub action: String,
+    #[serde(default)]
+    pub input: Option<Value>,
+}
+
+fn to_json_val(value: impl serde::Serialize) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+fn parse_download_item(input: &Value) -> HomarrResult<DownloadClientItem> {
+    let raw = input.get("item").unwrap_or(input).clone();
+    serde_json::from_value(raw)
+        .map_err(|err| HomarrError::BadRequest(format!("Invalid download item: {err}")))
+}
+
+fn parse_request_id(input: &Value) -> HomarrResult<i64> {
+    let val = input
+        .get("requestId")
+        .or_else(|| input.get("id"))
+        .ok_or_else(|| HomarrError::BadRequest("requestId is required".into()))?;
+    if let Some(n) = val.as_i64() {
+        return Ok(n);
+    }
+    if let Some(s) = val.as_str() {
+        return s
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| HomarrError::BadRequest(format!("Invalid requestId '{s}'")));
+    }
+    Err(HomarrError::BadRequest("Invalid requestId".into()))
+}
+
+pub async fn execute_integration_action(
+    RequireAuth(session): RequireAuth,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<IntegrationActionBody>,
+) -> HomarrResult<Json<Value>> {
+    session.require_writable(state.demo_read_only_active())?;
+    check_integration_permission(&state.db, &session, &id, IntegrationPermission::Interact).await?;
+    let ctx = load_ctx(&state, &id).await?;
+    let input = body.input.unwrap_or(Value::Null);
+    match body.action.trim() {
+        "dnsHoleEnable" => state.integrations.dns_hole_enable(&ctx).await?,
+        "dnsHoleDisable" => {
+            let duration = input.get("duration").and_then(Value::as_u64);
+            state.integrations.dns_hole_disable(&ctx, duration).await?;
+        }
+        "downloadsPauseQueue" => state.integrations.downloads_pause_queue(&ctx).await?,
+        "downloadsResumeQueue" => state.integrations.downloads_resume_queue(&ctx).await?,
+        "downloadsPauseItem" => {
+            let item = parse_download_item(&input)?;
+            state.integrations.downloads_pause_item(&ctx, &item).await?;
+        }
+        "downloadsResumeItem" => {
+            let item = parse_download_item(&input)?;
+            state
+                .integrations
+                .downloads_resume_item(&ctx, &item)
+                .await?;
+        }
+        "downloadsDeleteItem" => {
+            let item = parse_download_item(&input)?;
+            let from_disk = input
+                .get("fromDisk")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            state
+                .integrations
+                .downloads_delete_item(&ctx, &item, from_disk)
+                .await?;
+        }
+        "indexersTestAll" => state.integrations.indexers_test_all(&ctx).await?,
+        "mediaRequestApprove" => {
+            let req_id = parse_request_id(&input)?;
+            state
+                .integrations
+                .media_request_approve(&ctx, req_id)
+                .await?;
+        }
+        "mediaRequestDecline" => {
+            let req_id = parse_request_id(&input)?;
+            state
+                .integrations
+                .media_request_decline(&ctx, req_id)
+                .await?;
+        }
+        "smartHomeExecuteAction" => {
+            let entity_id = input
+                .get("entityId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| HomarrError::BadRequest("entityId is required".into()))?;
+            let action_val = input
+                .get("action")
+                .cloned()
+                .ok_or_else(|| HomarrError::BadRequest("action payload is required".into()))?;
+            let smart_action: SmartHomeAction =
+                serde_json::from_value(action_val).map_err(|err| {
+                    HomarrError::BadRequest(format!("Invalid smart home action: {err}"))
+                })?;
+            let receipt = state
+                .integrations
+                .smart_home_execute_action(&ctx, entity_id, &smart_action)
+                .await?;
+            return Ok(Json(json!({ "ok": true, "receipt": receipt })));
+        }
+        "integrationData" => {
+            let operation = input
+                .get("operation")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    HomarrError::BadRequest(
+                        "input.operation is required for integrationData".into(),
+                    )
+                })?;
+            let result = state
+                .integrations
+                .integration_data(&ctx, operation, &input)
+                .await?;
+            return Ok(Json(json!({ "ok": true, "result": result })));
+        }
+        other => {
+            return Err(HomarrError::BadRequest(format!(
+                "Unsupported integration action '{other}'"
+            )))
+        }
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 pub async fn get_integration_permissions(

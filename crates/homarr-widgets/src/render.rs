@@ -1,18 +1,66 @@
 use homarr_definitions::WidgetKind;
-use html_escape::encode_text;
+use html_escape::{encode_double_quoted_attribute as encode_attr, encode_text};
 use serde_json::Value;
+use url::Url;
 
 use crate::registry::get_widget_metadata;
 
-/// Filters unsafe URL schemes (`javascript:`, `data:text/html`, etc.) in rendered anchors/images.
+/// Filters unsafe URL schemes (`javascript:`, `data:text/html`, protocol-relative `//`, quotes)
+/// in rendered anchors/images/frames.
 pub fn safe_url(raw: &str) -> &str {
     let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("//")
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+    {
+        return "#";
+    }
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") || trimmed.starts_with('/') {
         trimmed
     } else {
         "#"
     }
+}
+
+fn host_port_key(url: &Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(match url.port_or_known_default() {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    })
+}
+
+fn is_same_origin_url(safe: &str, self_host_or_origin: Option<&str>) -> bool {
+    let Ok(target) = Url::parse(safe) else {
+        return false;
+    };
+    let check_against = |candidate: &str| -> bool {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if let Ok(origin_url) = Url::parse(trimmed) {
+            return target.origin() == origin_url.origin();
+        }
+        // Host[:port] without scheme (e.g., from Host / X-Forwarded-Host header): compare host+port
+        if let Ok(synthetic) = Url::parse(&format!("{}://{trimmed}", target.scheme())) {
+            return host_port_key(&target) == host_port_key(&synthetic);
+        }
+        false
+    };
+
+    if self_host_or_origin.is_some_and(check_against) {
+        return true;
+    }
+    if let Ok(base) = std::env::var("BASE_URL") {
+        if check_against(&base) {
+            return true;
+        }
+    }
+    false
 }
 
 fn safe_hex_color(raw: &str) -> &str {
@@ -164,8 +212,20 @@ pub fn render_widget_html(
     options: &Value,
     data: &Value,
 ) -> String {
+    render_widget_html_with_origin(kind, item_id, options, data, None)
+}
+
+/// Renders an XSS-safe HTML card body for any `WidgetKind`, stripping `allow-same-origin`
+/// on `iframe` embeds that target `self_origin` (origin URL or `host[:port]`).
+pub fn render_widget_html_with_origin(
+    kind: WidgetKind,
+    item_id: &str,
+    options: &Value,
+    data: &Value,
+    self_origin: Option<&str>,
+) -> String {
     let meta = get_widget_metadata(kind);
-    let safe_id = encode_text(item_id);
+    let safe_id = encode_attr(item_id);
     let custom_title = options
         .get("title")
         .and_then(|v| v.as_str())
@@ -185,7 +245,7 @@ pub fn render_widget_html(
   </div>
   <div class="widget-empty">Assign a compatible integration in board edit mode to display live telemetry.</div>
 </div>"#,
-            kind_str = encode_text(kind.as_str()),
+            kind_str = encode_attr(kind.as_str()),
             icon = widget_header_icon(kind),
         );
     }
@@ -199,7 +259,7 @@ pub fn render_widget_html(
         WidgetKind::Notebook => render_notebook(options),
         WidgetKind::Countdown => render_countdown(options),
         WidgetKind::Timer => render_timer(options),
-        WidgetKind::Iframe => render_iframe(options),
+        WidgetKind::Iframe => render_iframe(options, self_origin),
         WidgetKind::Video => render_video(options),
         WidgetKind::RssFeed => render_rss(data),
         WidgetKind::StockPrice => render_stock(data),
@@ -222,9 +282,21 @@ pub fn render_widget_html(
         WidgetKind::Notifications => render_notifications(data),
         WidgetKind::IndexerManager => render_indexers(data),
         WidgetKind::Ups => render_ups(data),
+        WidgetKind::MediaMissing => render_media_missing(data),
+        WidgetKind::MediaReleases => render_media_releases(data),
+        WidgetKind::MediaTranscoding => render_media_transcoding(data),
+        WidgetKind::Firewall => render_firewall(data),
+        WidgetKind::Vpn => render_vpn(data),
+        WidgetKind::Traefik => render_traefik(data),
+        WidgetKind::NetworkControllerSummary | WidgetKind::NetworkControllerStatus => {
+            render_network_controller(data)
+        }
+        WidgetKind::AnchorNote => render_anchor_note(data),
         WidgetKind::Stats => render_stats(data),
         WidgetKind::CustomApi => render_custom_api(data),
         WidgetKind::Assistant => render_assistant(options),
+        _ if data.get("error").and_then(|v| v.as_str()).is_some() => render_generic(data),
+        _ if data.get("stats").is_some() => render_stats_with_extras(kind, data),
         _ => render_generic(data),
     };
 
@@ -248,13 +320,13 @@ pub fn render_widget_html(
   </div>
   <div class="widget-body">{body}</div>
 </div>"#,
-            kind_str = encode_text(kind.as_str()),
+            kind_str = encode_attr(kind.as_str()),
             icon = widget_header_icon(kind),
         )
     } else {
         format!(
             r#"<div class="widget-shell widget-shell-flush widget-{kind_str}" data-item-id="{safe_id}">{body}</div>"#,
-            kind_str = encode_text(kind.as_str()),
+            kind_str = encode_attr(kind.as_str()),
         )
     }
 }
@@ -263,12 +335,12 @@ fn render_app(options: &Value, data: &Value) -> String {
     let Some(app) = data.get("app").filter(|v| !v.is_null()) else {
         return r#"<div class="widget-empty">Select an App</div>"#.to_string();
     };
-    let name = encode_text(app.get("name").and_then(|v| v.as_str()).unwrap_or("App"));
+    let name_raw = app.get("name").and_then(|v| v.as_str()).unwrap_or("App");
+    let name = encode_text(name_raw);
     let desc_raw = app
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let desc = encode_text(desc_raw);
     let icon = safe_url(
         app.get("iconUrl")
             .and_then(|v| v.as_str())
@@ -310,21 +382,23 @@ fn render_app(options: &Value, data: &Value) -> String {
         String::new()
     };
 
-    let title_attr = if desc_raw.is_empty() {
-        name.to_string()
+    let title_raw = if desc_raw.is_empty() {
+        name_raw.to_string()
     } else {
-        format!("{name} — {desc}")
+        format!("{name_raw} — {desc_raw}")
     };
 
     format!(
         r#"<a class="app-tile" href="{href}" target="_blank" rel="noopener noreferrer" data-ping-url="{ping}" title="{title_attr}">
-  <img class="app-icon" src="{icon}" alt="{name}" loading="lazy" onerror="this.onerror=null;this.src='/logo/homarr.svg'" />
+  <img class="app-icon" src="{icon}" alt="{alt_name}" loading="lazy" onerror="this.onerror=null;this.src='/logo/homarr.svg'" />
   {title_html}
   {ping_badge}
 </a>"#,
-        href = encode_text(href),
-        icon = encode_text(icon),
-        ping = encode_text(ping_url),
+        href = encode_attr(href),
+        icon = encode_attr(icon),
+        ping = encode_attr(ping_url),
+        title_attr = encode_attr(&title_raw),
+        alt_name = encode_attr(name_raw),
     )
 }
 
@@ -340,7 +414,7 @@ fn render_bookmarks(options: &Value) -> String {
     let mut html = String::from(r#"<div class="bookmark-chips">"#);
     for item in items.iter().take(20) {
         let name = encode_text(item.get("name").and_then(|v| v.as_str()).unwrap_or("Link"));
-        let href = encode_text(safe_url(
+        let href = encode_attr(safe_url(
             item.get("href").and_then(|v| v.as_str()).unwrap_or("#"),
         ));
         let icon_url = item
@@ -351,7 +425,7 @@ fn render_bookmarks(options: &Value) -> String {
         let icon_html = match icon_url {
             Some(url) => format!(
                 r#"<img class="bookmark-chip-icon" src="{}" alt="" loading="lazy" onerror="this.style.display='none'" />"#,
-                encode_text(url)
+                encode_attr(url)
             ),
             None => r#"<svg class="ui-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 15l6 -6" /><path d="M11 6l.463 -.536a5 5 0 0 1 7.071 7.072l-.534 .464" /><path d="M13 18l-.397 .534a5.068 5.068 0 0 1 -7.127 0a4.972 4.972 0 0 1 0 -7.071l.524 -.463" /></svg>"#.to_string(),
         };
@@ -513,15 +587,128 @@ fn render_air_quality(data: &Value) -> String {
     )
 }
 
+fn render_inline_md(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while !rest.is_empty() {
+        let next_bold = rest.find("**");
+        let next_code = rest.find('`');
+        let pick_bold = match (next_bold, next_code) {
+            (Some(b), Some(c)) => Some(b <= c),
+            (Some(_), None) => Some(true),
+            (None, Some(_)) => Some(false),
+            (None, None) => None,
+        };
+        match pick_bold {
+            Some(true) => {
+                let b = next_bold.unwrap_or(0);
+                out.push_str(&rest[..b]);
+                let after = &rest[b + 2..];
+                if let Some(end) = after.find("**") {
+                    out.push_str("<strong>");
+                    out.push_str(&after[..end]);
+                    out.push_str("</strong>");
+                    rest = &after[end + 2..];
+                } else {
+                    out.push_str("**");
+                    rest = after;
+                }
+            }
+            Some(false) => {
+                let c = next_code.unwrap_or(0);
+                out.push_str(&rest[..c]);
+                let after = &rest[c + 1..];
+                if let Some(end) = after.find('`') {
+                    out.push_str("<code>");
+                    out.push_str(&after[..end]);
+                    out.push_str("</code>");
+                    rest = &after[end + 1..];
+                } else {
+                    out.push('`');
+                    rest = after;
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn render_notebook(options: &Value) -> String {
     let content = options
         .get("content")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    format!(
-        r#"<div class="notebook-body"><pre class="notebook-text">{}</pre></div>"#,
-        encode_text(content)
-    )
+    if content.trim().is_empty() {
+        return r#"<div class="widget-empty">Empty note</div>"#.to_string();
+    }
+    let mut html = String::from(r#"<div class="notebook-body">"#);
+    let mut in_list = false;
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        let is_list_item = trimmed.starts_with("- ") || trimmed.starts_with("* ");
+        if !is_list_item && in_list {
+            html.push_str("</ul>");
+            in_list = false;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(h3) = trimmed.strip_prefix("### ") {
+            let esc = encode_text(h3);
+            html.push_str(&format!("<h6>{}</h6>", render_inline_md(&esc)));
+        } else if let Some(h2) = trimmed.strip_prefix("## ") {
+            let esc = encode_text(h2);
+            html.push_str(&format!("<h5>{}</h5>", render_inline_md(&esc)));
+        } else if let Some(h1) = trimmed.strip_prefix("# ") {
+            let esc = encode_text(h1);
+            html.push_str(&format!("<h4>{}</h4>", render_inline_md(&esc)));
+        } else if let Some(task) = trimmed
+            .strip_prefix("- [x] ")
+            .or_else(|| trimmed.strip_prefix("- [X] "))
+        {
+            if !in_list {
+                html.push_str(r#"<ul class="notebook-list">"#);
+                in_list = true;
+            }
+            let esc = encode_text(task);
+            html.push_str(&format!(
+                r#"<li class="notebook-task"><input type="checkbox" disabled checked /><span>{}</span></li>"#,
+                render_inline_md(&esc)
+            ));
+        } else if let Some(task) = trimmed.strip_prefix("- [ ] ") {
+            if !in_list {
+                html.push_str(r#"<ul class="notebook-list">"#);
+                in_list = true;
+            }
+            let esc = encode_text(task);
+            html.push_str(&format!(
+                r#"<li class="notebook-task"><input type="checkbox" disabled /><span>{}</span></li>"#,
+                render_inline_md(&esc)
+            ));
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            if !in_list {
+                html.push_str(r#"<ul class="notebook-list">"#);
+                in_list = true;
+            }
+            let esc = encode_text(item);
+            html.push_str(&format!("<li>{}</li>", render_inline_md(&esc)));
+        } else {
+            let esc = encode_text(trimmed);
+            html.push_str(&format!("<p>{}</p>", render_inline_md(&esc)));
+        }
+    }
+    if in_list {
+        html.push_str("</ul>");
+    }
+    html.push_str("</div>");
+    html
 }
 
 fn render_countdown(options: &Value) -> String {
@@ -531,9 +718,11 @@ fn render_countdown(options: &Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("Countdown"),
     );
-    let date = encode_text(options.get("date").and_then(|v| v.as_str()).unwrap_or(""));
+    let date_raw = options.get("date").and_then(|v| v.as_str()).unwrap_or("");
+    let date_attr = encode_attr(date_raw);
+    let date = encode_text(date_raw);
     format!(
-        r#"<div class="countdown-widget" data-target-date="{date}">
+        r#"<div class="countdown-widget" data-target-date="{date_attr}">
   <div class="metric-sub">{title}</div>
   <div class="metric-big js-countdown">--d --h --m</div>
   <div class="metric-sub">{date}</div>
@@ -566,7 +755,7 @@ fn render_timer(options: &Value) -> String {
     )
 }
 
-fn render_iframe(options: &Value) -> String {
+fn render_iframe(options: &Value, self_origin: Option<&str>) -> String {
     let raw = options
         .get("embedUrl")
         .and_then(|v| v.as_str())
@@ -575,9 +764,16 @@ fn render_iframe(options: &Value) -> String {
     if safe == "#" {
         return r#"<div class="widget-empty">Invalid embed URL</div>"#.to_string();
     }
+    // Same-origin (relative or matching Homarr's own origin) targets must never get
+    // `allow-same-origin`, otherwise the framed page could reach Homarr's origin.
+    let sandbox = if safe.starts_with('/') || is_same_origin_url(safe, self_origin) {
+        "allow-scripts allow-forms"
+    } else {
+        "allow-scripts allow-same-origin allow-forms"
+    };
     format!(
-        r#"<iframe class="widget-iframe" src="{}" sandbox="allow-scripts allow-same-origin allow-forms" loading="lazy"></iframe>"#,
-        encode_text(safe)
+        r#"<iframe class="widget-iframe" src="{}" sandbox="{sandbox}" loading="lazy"></iframe>"#,
+        encode_attr(safe)
     )
 }
 
@@ -592,7 +788,7 @@ fn render_video(options: &Value) -> String {
     }
     format!(
         r#"<video class="widget-video" src="{}" controls muted playsinline></video>"#,
-        encode_text(safe)
+        encode_attr(safe)
     )
 }
 
@@ -612,7 +808,7 @@ fn render_rss(data: &Value) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("Untitled"),
         );
-        let link = encode_text(safe_url(
+        let link = encode_attr(safe_url(
             e.get("link").and_then(|v| v.as_str()).unwrap_or("#"),
         ));
         html.push_str(&format!(
@@ -673,7 +869,7 @@ fn render_release(data: &Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown"),
     );
-    let url = encode_text(safe_url(
+    let url = encode_attr(safe_url(
         rel.get("url").and_then(|v| v.as_str()).unwrap_or("#"),
     ));
     format!(
@@ -733,7 +929,9 @@ fn render_downloads(data: &Value) -> String {
         items.len()
     );
     for item in items.iter().take(6) {
-        let name = encode_text(item.get("name").and_then(|v| v.as_str()).unwrap_or(""));
+        let name_raw = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let name = encode_text(name_raw);
+        let name_attr = encode_attr(name_raw);
         let state = encode_text(item.get("state").and_then(|v| v.as_str()).unwrap_or(""));
         let pct = (item.get("progress").and_then(|v| v.as_f64()).unwrap_or(0.0) * 100.0)
             .clamp(0.0, 100.0);
@@ -755,7 +953,7 @@ fn render_downloads(data: &Value) -> String {
         html.push_str(&format!(
             r#"<div class="download-row">
   <div class="download-top">
-    <span class="download-name" title="{name}">{name}</span>
+    <span class="download-name" title="{name_attr}">{name}</span>
     <span class="badge">{state}</span>
   </div>
   <div class="progress-track"><div class="{fill_cls}" style="width:{pct:.1}%"></div></div>
@@ -1240,14 +1438,347 @@ fn render_assistant(options: &Value) -> String {
     )
 }
 
+fn render_stats_with_extras(kind: WidgetKind, data: &Value) -> String {
+    let mut html = render_stats(data);
+    if kind == WidgetKind::BeszelAlerts {
+        if let Some(alerts) = data.get("alerts").and_then(|v| v.as_array()) {
+            if !alerts.is_empty() {
+                html.push_str(r#"<ul class="compact-list" style="margin-top:8px">"#);
+                for alert in alerts.iter().take(4) {
+                    let name = encode_text(
+                        alert
+                            .get("name")
+                            .or_else(|| alert.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Alert"),
+                    );
+                    let level_str = alert
+                        .get("value")
+                        .and_then(|v| v.as_f64())
+                        .map(|n| format!("{n:.0}"))
+                        .unwrap_or_else(|| "active".to_string());
+                    let level = encode_text(&level_str);
+                    html.push_str(&format!(
+                        r#"<li><span>{name}</span> <span class="badge">{level}</span></li>"#
+                    ));
+                }
+                html.push_str("</ul>");
+            }
+        }
+    }
+    html
+}
+
+fn render_error_box(data: &Value) -> Option<String> {
+    data.get("error")
+        .and_then(|v| v.as_str())
+        .map(|err| format!(r#"<div class="widget-empty">{}</div>"#, encode_text(err)))
+}
+
+fn render_media_releases(data: &Value) -> String {
+    if let Some(err_html) = render_error_box(data) {
+        return err_html;
+    }
+    let releases = data
+        .get("releases")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if releases.is_empty() {
+        return r#"<div class="widget-empty">No recent media releases</div>"#.to_string();
+    }
+    let mut html = String::from(r#"<ul class="compact-list">"#);
+    for rel in releases.iter().take(6) {
+        let title = encode_text(
+            rel.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Untitled"),
+        );
+        let sub = rel
+            .get("subtitle")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!(r#" <span class="muted">{}</span>"#, encode_text(s)))
+            .unwrap_or_default();
+        let href = safe_url(rel.get("href").and_then(|v| v.as_str()).unwrap_or("#"));
+        let date_str = rel
+            .get("releaseDate")
+            .and_then(|v| v.as_str())
+            .map(|s| s.chars().take(10).collect::<String>())
+            .unwrap_or_default();
+        let date = encode_text(&date_str);
+        let title_el = if href == "#" {
+            format!(r#"<span>{title}{sub}</span>"#)
+        } else {
+            format!(
+                r#"<a href="{}" target="_blank" rel="noopener noreferrer">{title}{sub}</a>"#,
+                encode_attr(href)
+            )
+        };
+        html.push_str(&format!(
+            r#"<li>{title_el} <span class="badge">{date}</span></li>"#
+        ));
+    }
+    html.push_str("</ul>");
+    html
+}
+
+fn render_media_missing(data: &Value) -> String {
+    if let Some(err_html) = render_error_box(data) {
+        return err_html;
+    }
+    let items = data
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        return r#"<div class="widget-empty">No missing media</div>"#.to_string();
+    }
+    let mut html = String::from(r#"<ul class="compact-list">"#);
+    for item in items.iter().take(8) {
+        let title = encode_text(item.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+        let sub = encode_text(
+            item.get("subtitle")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Missing"),
+        );
+        html.push_str(&format!(
+            r#"<li><span>{title}</span> <span class="badge">{sub}</span></li>"#
+        ));
+    }
+    html.push_str("</ul>");
+    html
+}
+
+fn render_media_transcoding(data: &Value) -> String {
+    if let Some(err_html) = render_error_box(data) {
+        return err_html;
+    }
+    let Some(summary) = data.get("summary") else {
+        return r#"<div class="widget-empty">Transcoding stats unavailable</div>"#.to_string();
+    };
+    let files = summary
+        .get("totalFiles")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let queue = summary
+        .get("queueCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let workers = summary
+        .get("activeWorkers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let saved = summary
+        .get("spaceSavedBytes")
+        .and_then(|v| v.as_u64())
+        .map(format_si_bytes)
+        .unwrap_or_else(|| "0 B".to_string());
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat-pill"><span class="label">Files</span><strong>{files}</strong></div>
+  <div class="stat-pill"><span class="label">Queue</span><strong>{queue}</strong></div>
+  <div class="stat-pill"><span class="label">Workers</span><strong>{workers}</strong></div>
+  <div class="stat-pill"><span class="label">Saved</span><strong>{}</strong></div>
+</div>"#,
+        encode_text(&saved)
+    )
+}
+
+fn render_firewall(data: &Value) -> String {
+    if let Some(err_html) = render_error_box(data) {
+        return err_html;
+    }
+    let cpu = data
+        .get("cpu")
+        .and_then(|c| c.get("total"))
+        .and_then(|v| v.as_f64())
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "—".to_string());
+    let mem = data
+        .get("memory")
+        .and_then(|m| m.get("percent"))
+        .and_then(|v| v.as_f64())
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "—".to_string());
+    let ver = data
+        .get("version")
+        .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("OPNsense");
+    let if_count = data
+        .get("interfaces")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|entry| entry.get("data"))
+        .and_then(|d| d.as_array())
+        .map(|d| d.len())
+        .unwrap_or(0);
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat-pill"><span class="label">CPU</span><strong>{}</strong></div>
+  <div class="stat-pill"><span class="label">Memory</span><strong>{}</strong></div>
+  <div class="stat-pill"><span class="label">Interfaces</span><strong>{if_count}</strong></div>
+  <div class="stat-pill"><span class="label">Version</span><strong>{}</strong></div>
+</div>"#,
+        encode_text(&cpu),
+        encode_text(&mem),
+        encode_text(ver),
+    )
+}
+
+fn render_vpn(data: &Value) -> String {
+    if let Some(err_html) = render_error_box(data) {
+        return err_html;
+    }
+    let Some(vpn) = data.get("vpn") else {
+        return r#"<div class="widget-empty">VPN status unavailable</div>"#.to_string();
+    };
+    let status = encode_text(
+        vpn.get("vpnStatus")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+    );
+    let ip = encode_text(vpn.get("publicIp").and_then(|v| v.as_str()).unwrap_or("—"));
+    let country = encode_text(vpn.get("country").and_then(|v| v.as_str()).unwrap_or("—"));
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat-pill"><span class="label">Status</span><strong>{status}</strong></div>
+  <div class="stat-pill"><span class="label">Public IP</span><strong>{ip}</strong></div>
+  <div class="stat-pill"><span class="label">Country</span><strong>{country}</strong></div>
+</div>"#
+    )
+}
+
+fn render_traefik(data: &Value) -> String {
+    if let Some(err_html) = render_error_box(data) {
+        return err_html;
+    }
+    let Some(t) = data.get("traefik") else {
+        return r#"<div class="widget-empty">Traefik overview unavailable</div>"#.to_string();
+    };
+    let sum_field = |group: &str| -> u64 {
+        ["http", "tcp", "udp"]
+            .iter()
+            .filter_map(|p| {
+                t.get(p)
+                    .and_then(|x| x.get(group))
+                    .and_then(|g| g.get("total"))
+                    .and_then(|v| v.as_u64())
+            })
+            .sum()
+    };
+    let routers = sum_field("routers");
+    let services = sum_field("services");
+    let middlewares = sum_field("middlewares");
+    let version = encode_text(
+        t.get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Traefik"),
+    );
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat-pill"><span class="label">Routers</span><strong>{routers}</strong></div>
+  <div class="stat-pill"><span class="label">Services</span><strong>{services}</strong></div>
+  <div class="stat-pill"><span class="label">Middleware</span><strong>{middlewares}</strong></div>
+  <div class="stat-pill"><span class="label">Version</span><strong>{version}</strong></div>
+</div>"#
+    )
+}
+
+fn render_network_controller(data: &Value) -> String {
+    if let Some(err_html) = render_error_box(data) {
+        return err_html;
+    }
+    let Some(net) = data.get("network") else {
+        return r#"<div class="widget-empty">Network controller unavailable</div>"#.to_string();
+    };
+    let wifi = net
+        .get("wifi")
+        .map(|w| {
+            w.get("users").and_then(|v| v.as_u64()).unwrap_or(0)
+                + w.get("guests").and_then(|v| v.as_u64()).unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let lan = net
+        .get("lan")
+        .map(|l| {
+            l.get("users").and_then(|v| v.as_u64()).unwrap_or(0)
+                + l.get("guests").and_then(|v| v.as_u64()).unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let latency = net
+        .get("www")
+        .and_then(|w| w.get("latency"))
+        .and_then(|v| v.as_f64())
+        .map(|l| format!("{l:.1} ms"))
+        .unwrap_or_else(|| "—".to_string());
+    let wan = encode_text(
+        net.get("wanStatus")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+    );
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat-pill"><span class="label">WAN</span><strong>{wan}</strong></div>
+  <div class="stat-pill"><span class="label">Wi-Fi</span><strong>{wifi}</strong></div>
+  <div class="stat-pill"><span class="label">LAN</span><strong>{lan}</strong></div>
+  <div class="stat-pill"><span class="label">Latency</span><strong>{}</strong></div>
+</div>"#,
+        encode_text(&latency)
+    )
+}
+
+fn render_anchor_note(data: &Value) -> String {
+    if let Some(err_html) = render_error_box(data) {
+        return err_html;
+    }
+    if let Some(note) = data.get("note") {
+        let title = encode_text(note.get("title").and_then(|v| v.as_str()).unwrap_or("Note"));
+        let content = encode_text(note.get("content").and_then(|v| v.as_str()).unwrap_or(""));
+        return format!(
+            r#"<div class="notebook-body"><strong>{title}</strong><p style="margin-top:6px;white-space:pre-wrap">{content}</p></div>"#
+        );
+    }
+    let notes = data
+        .get("notes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if notes.is_empty() {
+        return r#"<div class="widget-empty">No notes found</div>"#.to_string();
+    }
+    let mut html = String::from(r#"<ul class="compact-list">"#);
+    for note in notes.iter().take(6) {
+        let title = encode_text(
+            note.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Untitled"),
+        );
+        let pinned = if note
+            .get("isPinned")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            r#"<span class="badge">pinned</span>"#
+        } else {
+            ""
+        };
+        html.push_str(&format!(r#"<li><span>{title}</span> {pinned}</li>"#));
+    }
+    html.push_str("</ul>");
+    html
+}
+
 fn render_generic(data: &Value) -> String {
     if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
         return format!(r#"<div class="widget-empty">{}</div>"#, encode_text(err));
     }
     let raw = data.get("data").unwrap_or(data);
     let summary = raw.to_string();
-    let clipped = if summary.len() > 280 {
-        format!("{}...", &summary[..280])
+    let clipped = if summary.chars().count() > 280 {
+        format!("{}...", summary.chars().take(280).collect::<String>())
     } else {
         summary
     };

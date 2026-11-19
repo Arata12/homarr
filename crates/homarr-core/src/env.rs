@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use homarr_common::{generate_secure_random_token, HomarrError, HomarrResult};
 
@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub secret_encryption_key: String,
     pub auth_secret: String,
     pub auth_cookie_prefix: String,
+    /// Explicit `AUTH_COOKIE_SECURE` override for the session cookie `Secure` flag.
+    pub auth_cookie_secure: Option<bool>,
     pub auth_providers: Vec<String>,
     pub auth_session_expiry_secs: i64,
     pub auth_trusted_proxy_header: Option<String>,
@@ -63,6 +65,106 @@ fn parse_csv(key: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn parse_bool_opt(key: &str) -> Option<bool> {
+    let val = non_empty_env(key)?;
+    match val.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn is_valid_hex_64(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_non_empty(value: &str) -> bool {
+    !value.is_empty()
+}
+
+/// Loads a persisted secret from `<dir>/secrets/<file_name>`, generating and persisting a new one
+/// atomically (mode 0600 on unix) when absent, empty, or invalid. Falls back to an ephemeral secret
+/// only if persisting fails. The secret value is never logged.
+fn load_or_create_secret(
+    dir: &Path,
+    file_name: &str,
+    label: &str,
+    validate: fn(&str) -> bool,
+) -> String {
+    let path = dir.join("secrets").join(file_name);
+    match std::fs::read_to_string(&path) {
+        Ok(existing) => {
+            let trimmed = existing.trim();
+            if validate(trimmed) {
+                return trimmed.to_string();
+            }
+            eprintln!(
+                "Warning: {label} at {} was empty or invalid; regenerating a new persisted value.",
+                path.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!(
+                "Warning: {label} is not set and {} could not be read ({e}); using an ephemeral value for this process.",
+                path.display()
+            );
+            return generate_secure_random_token(32);
+        }
+    }
+
+    let generated = generate_secure_random_token(32);
+    match write_secret_file(&path, &generated) {
+        Ok(()) => eprintln!(
+            "Warning: {label} is not set; generated a value and persisted it at {}. Set {label} explicitly in production.",
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "Warning: {label} is not set and could not be persisted at {} ({e}); using an ephemeral value for this process.",
+            path.display()
+        ),
+    }
+    generated
+}
+
+fn write_secret_file(path: &Path, value: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("secret");
+    let nonce = generate_secure_random_token(8);
+    let tmp_path = parent.join(format!(".tmp-{file_name}-{}-{nonce}", std::process::id()));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let res = (|| -> std::io::Result<()> {
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(value.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    res
 }
 
 fn non_empty_env(key: &str) -> Option<String> {
@@ -125,9 +227,13 @@ impl AppConfig {
             }
         };
 
+        let static_data_dir = non_empty_env("STATIC_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("static-data"));
+
         let secret_encryption_key = match non_empty_env("SECRET_ENCRYPTION_KEY") {
             Some(key) => {
-                if key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+                if !is_valid_hex_64(&key) {
                     let candidate = generate_secure_random_token(32);
                     return Err(HomarrError::BadRequest(format!(
                         "SECRET_ENCRYPTION_KEY must be a 64-character hex string; candidate: \"{candidate}\""
@@ -135,17 +241,17 @@ impl AppConfig {
                 }
                 key
             }
-            None => {
-                let generated = generate_secure_random_token(32);
-                eprintln!(
-                    "Warning: SECRET_ENCRYPTION_KEY is not set; using ephemeral key for this process. Set SECRET_ENCRYPTION_KEY in production (candidate: {generated})."
-                );
-                generated
-            }
+            None => load_or_create_secret(
+                &static_data_dir,
+                "secret_encryption_key",
+                "SECRET_ENCRYPTION_KEY",
+                is_valid_hex_64,
+            ),
         };
 
-        let auth_secret =
-            non_empty_env("AUTH_SECRET").unwrap_or_else(|| generate_secure_random_token(32));
+        let auth_secret = non_empty_env("AUTH_SECRET").unwrap_or_else(|| {
+            load_or_create_secret(&static_data_dir, "auth_secret", "AUTH_SECRET", is_non_empty)
+        });
 
         let host = non_empty_env("HOST").unwrap_or_else(|| "0.0.0.0".to_string());
         let port = non_empty_env("PORT")
@@ -208,10 +314,6 @@ impl AppConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("assets"));
 
-        let static_data_dir = non_empty_env("STATIC_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("static-data"));
-
         Ok(Self {
             host,
             port,
@@ -222,6 +324,7 @@ impl AppConfig {
             auth_secret,
             auth_cookie_prefix: non_empty_env("AUTH_COOKIE_PREFIX")
                 .unwrap_or_else(|| "homarr".to_string()),
+            auth_cookie_secure: parse_bool_opt("AUTH_COOKIE_SECURE"),
             auth_providers,
             auth_session_expiry_secs,
             auth_trusted_proxy_header: non_empty_env("AUTH_TRUSTED_PROXY_HEADER"),
@@ -261,6 +364,7 @@ impl AppConfig {
             secret_encryption_key: "0".repeat(64),
             auth_secret: "1".repeat(64),
             auth_cookie_prefix: "homarr".to_string(),
+            auth_cookie_secure: None,
             auth_providers: vec!["credentials".to_string()],
             auth_session_expiry_secs: 86_400,
             auth_trusted_proxy_header: None,
@@ -311,5 +415,58 @@ mod tests {
     fn test_config_for_test_builds_valid_redis_url() {
         let cfg = AppConfig::for_test();
         assert_eq!(cfg.redis_url(), "redis://127.0.0.1:6379/0");
+    }
+
+    #[test]
+    fn generated_secret_is_persisted_and_reloaded() {
+        let dir = std::env::temp_dir().join(format!("homarr-secret-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = load_or_create_secret(&dir, "k", "TEST", is_valid_hex_64);
+        assert_eq!(first.len(), 64);
+        assert_eq!(
+            first,
+            load_or_create_secret(&dir, "k", "TEST", is_valid_hex_64)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("secrets/k"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repairs_empty_or_invalid_persisted_secret() {
+        let dir = std::env::temp_dir().join(format!("homarr-secret-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        let path = dir.join("secrets/secret_encryption_key");
+
+        // 0-byte leftover file
+        std::fs::write(&path, "").unwrap();
+        let repaired =
+            load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64);
+        assert!(is_valid_hex_64(&repaired));
+        assert_eq!(
+            repaired,
+            load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64)
+        );
+
+        // Non-hex corrupted file
+        std::fs::write(&path, "not-a-valid-hex-key").unwrap();
+        let repaired2 =
+            load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64);
+        assert!(is_valid_hex_64(&repaired2));
+        assert_ne!(repaired2, "not-a-valid-hex-key");
+        assert_eq!(
+            repaired2,
+            load_or_create_secret(&dir, "secret_encryption_key", "SECRET", is_valid_hex_64)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

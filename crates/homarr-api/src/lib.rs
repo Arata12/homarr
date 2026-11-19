@@ -1,3 +1,4 @@
+pub mod csrf;
 pub mod mcp;
 pub mod openapi;
 pub mod routes;
@@ -49,6 +50,7 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(boards::delete_board),
         )
         .route("/api/boards/{id}/layout", put(boards::save_board_layout))
+        .route("/api/boards/{id}/layouts", put(boards::set_board_layouts))
         .route("/api/boards/{id}/items", post(boards::create_board_item))
         .route(
             "/api/boards/{id}/items/{item_id}",
@@ -96,6 +98,18 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/integrations/{id}/data",
             get(integrations::get_integration_data),
+        )
+        .route(
+            "/api/integrations/{id}/stats",
+            get(integrations::get_integration_stats),
+        )
+        .route(
+            "/api/integrations/{id}/query",
+            post(integrations::query_integration),
+        )
+        .route(
+            "/api/integrations/{id}/actions",
+            post(integrations::execute_integration_action),
         )
         .route(
             "/api/integrations/{id}/permissions",
@@ -313,6 +327,10 @@ pub fn api_router(state: AppState) -> Router {
             get(ws::ws_handler)
                 .route_layer(axum::middleware::from_fn(ws::reject_api_key_middleware)),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            csrf::csrf_middleware,
+        ))
         .with_state(state)
 }
 
@@ -412,11 +430,29 @@ mod tests {
             .unwrap()
             .to_string();
 
-        // 4. Create -> list -> delete App with cookie
+        // 4. Cookie-authenticated writes need a same-origin Origin (CSRF)
+        let csrf_resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/apps")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://evil.example")
+                    .header(header::COOKIE, &set_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"X"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(csrf_resp.status(), StatusCode::FORBIDDEN);
+
+        // Create -> list -> delete App with cookie
         let create_resp = app
             .clone()
             .oneshot(
                 Request::post("/api/apps")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
                     .header(header::COOKIE, &set_cookie)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -435,6 +471,8 @@ mod tests {
             .clone()
             .oneshot(
                 Request::delete(format!("/api/apps/{app_id}"))
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
                     .header(header::COOKIE, &set_cookie)
                     .body(Body::empty())
                     .unwrap(),

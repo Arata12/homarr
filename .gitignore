@@ -1,5 +1,6 @@
 # Rust build artifacts
 target/
+.ci-cache/
 **/*.rs.bk
 
 # Databases & local appdata
@@ -15,6 +16,7 @@ appdata/
 .env
 .env.*
 !.env.example
+static-data/secrets/
 
 # Editor & OS metadata
 .DS_Store

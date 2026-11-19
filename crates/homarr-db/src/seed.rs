@@ -493,6 +493,229 @@ pub async fn seed_demo(db: &Database, _crypto: &SecretCrypto) -> HomarrResult<()
     Ok(())
 }
 
+/// Seeds a clean starter board (`dashboard` or requested board name) with 4 starter apps
+/// and 7 initial widgets (matching fresh upstream onboarding) for the first administrator.
+pub async fn seed_starter_board(
+    db: &Database,
+    creator_id: &str,
+    board_name: &str,
+    column_count: i32,
+) -> HomarrResult<String> {
+    let cleaned: String = board_name
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    let final_name = if cleaned.is_empty() {
+        "dashboard".to_string()
+    } else {
+        cleaned
+    };
+    let cols = column_count.clamp(4, 24);
+
+    let existing_apps = apps::list_all(db).await?;
+    let docs_app = ensure_demo_app(
+        db,
+        &existing_apps,
+        "Homarr Docs",
+        "Official Homarr documentation",
+        "/logo/homarr.svg",
+        "https://homarr.dev/docs/getting-started",
+        None,
+    )
+    .await?;
+    let github_app = ensure_demo_app(
+        db,
+        &existing_apps,
+        "Homarr GitHub",
+        "Source code & issue tracker",
+        "/images/apps/github.svg",
+        "https://github.com/homarr-labs/homarr",
+        None,
+    )
+    .await?;
+    let translate_app = ensure_demo_app(
+        db,
+        &existing_apps,
+        "Help Translate",
+        "Community translations",
+        "/logo/homarr.svg",
+        "https://homarr.dev/docs/community/translations",
+        None,
+    )
+    .await?;
+    let support_app = ensure_demo_app(
+        db,
+        &existing_apps,
+        "Support Homarr",
+        "Support open-source development",
+        "/images/apps/opencollective.svg",
+        "https://opencollective.com/homarr",
+        None,
+    )
+    .await?;
+
+    let board = boards::create_board_with_defaults(
+        db,
+        boards::CreateBoardInput {
+            id: None,
+            name: final_name.clone(),
+            is_public: true,
+            creator_id: Some(creator_id.to_string()),
+            column_count: cols,
+        },
+    )
+    .await?;
+
+    let _ = boards::update_settings(
+        db,
+        &board.board.id,
+        boards::BoardSettingsPatch {
+            page_title: Some(Some(format!("{final_name} board"))),
+            item_radius: Some(Some("lg".to_string())),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let mobile_id = board
+        .layouts
+        .iter()
+        .find(|l| l.role == "mobile")
+        .map(|l| l.id.clone())
+        .unwrap_or_else(|| board.layouts[0].id.clone());
+    let desktop_id = board
+        .layouts
+        .iter()
+        .find(|l| l.role == "base")
+        .map(|l| l.id.clone())
+        .unwrap_or_else(|| board.layouts[0].id.clone());
+    let root_section_id = board
+        .sections
+        .first()
+        .map(|s| s.id.clone())
+        .unwrap_or_else(create_id);
+
+    let sections_in = vec![boards::SaveBoardSectionInput {
+        id: root_section_id.clone(),
+        kind: "empty".to_string(),
+        x_offset: Some(0),
+        y_offset: Some(0),
+        name: None,
+        options: json!({}),
+        layouts: Vec::<SectionLayoutRecord>::new(),
+    }];
+
+    let mk_layouts =
+        |item_id: &str, dx: i32, dy: i32, dw: i32, dh: i32, mx: i32, my: i32, mw: i32, mh: i32| {
+            vec![
+                ItemLayoutRecord {
+                    item_id: item_id.to_string(),
+                    section_id: root_section_id.clone(),
+                    layout_id: desktop_id.clone(),
+                    x_offset: dx.min(cols - dw.min(cols)),
+                    y_offset: dy,
+                    width: dw.min(cols),
+                    height: dh,
+                },
+                ItemLayoutRecord {
+                    item_id: item_id.to_string(),
+                    section_id: root_section_id.clone(),
+                    layout_id: mobile_id.clone(),
+                    x_offset: mx,
+                    y_offset: my,
+                    width: mw,
+                    height: mh,
+                },
+            ]
+        };
+
+    let starter_app = |id: String, app_id: &str, dx: i32, mx: i32| boards::SaveBoardItemInput {
+        id: id.clone(),
+        kind: "app".to_string(),
+        options: json!({
+            "appId": app_id,
+            "openInNewTab": true,
+            "showTitle": true,
+            "pingEnabled": true
+        }),
+        advanced_options: json!({}),
+        layouts: mk_layouts(&id, dx, 0, 1, 1, mx, 0, 1, 1),
+        integration_ids: vec![],
+    };
+
+    let i_clock = create_id();
+    let i_weather = create_id();
+    let i_bookmarks = create_id();
+
+    let items_in = vec![
+        starter_app(create_id(), &docs_app.id, 0, 0),
+        starter_app(create_id(), &github_app.id, 1, 1),
+        starter_app(create_id(), &translate_app.id, 2, 2),
+        starter_app(create_id(), &support_app.id, 3, 3),
+        boards::SaveBoardItemInput {
+            id: i_clock.clone(),
+            kind: "clock".to_string(),
+            options: json!({ "is24HourFormat": true, "showDate": true }),
+            advanced_options: json!({}),
+            layouts: mk_layouts(&i_clock, 4, 0, 2, 1, 0, 1, 2, 1),
+            integration_ids: vec![],
+        },
+        boards::SaveBoardItemInput {
+            id: i_weather.clone(),
+            kind: "weather".to_string(),
+            options: json!({
+                "location": { "name": "Zurich", "latitude": 47.3769, "longitude": 8.5417 },
+                "isFormatFahrenheit": false
+            }),
+            advanced_options: json!({}),
+            layouts: mk_layouts(&i_weather, 6, 0, 2, 1, 2, 1, 2, 1),
+            integration_ids: vec![],
+        },
+        boards::SaveBoardItemInput {
+            id: i_bookmarks.clone(),
+            kind: "bookmarks".to_string(),
+            options: json!({
+                "title": "Useful Links",
+                "layout": "list",
+                "openNewTab": true,
+                "items": [
+                    { "name": "Homarr Docs", "href": "https://homarr.dev/docs/getting-started", "iconUrl": "/logo/homarr.svg" },
+                    { "name": "Homarr GitHub", "href": "https://github.com/homarr-labs/homarr", "iconUrl": "/images/apps/github.svg" },
+                    { "name": "Help Translate", "href": "https://homarr.dev/docs/community/translations", "iconUrl": "/logo/homarr.svg" },
+                    { "name": "Support Homarr", "href": "https://opencollective.com/homarr", "iconUrl": "/images/apps/opencollective.svg" }
+                ]
+            }),
+            advanced_options: json!({}),
+            layouts: mk_layouts(&i_bookmarks, 8, 0, 2, 2, 0, 2, 4, 2),
+            integration_ids: vec![],
+        },
+    ];
+
+    boards::save_board_content(db, &board.board.id, &sections_in, &items_in).await?;
+
+    let _ = users::update_preferences(
+        db,
+        creator_id,
+        users::UpdateUserPreferencesInput {
+            home_board_id: Some(Some(board.board.id.clone())),
+            mobile_home_board_id: Some(Some(board.board.id.clone())),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let mut board_settings = settings::get_setting(db, "board").await?;
+    if let Some(obj) = board_settings.as_object_mut() {
+        obj.insert("homeBoardId".to_string(), json!(board.board.id));
+        obj.insert("mobileHomeBoardId".to_string(), json!(board.board.id));
+    }
+    settings::set_setting(db, "board", &board_settings).await?;
+    settings::set_onboarding(db, "finish", Some("start")).await?;
+    Ok(board.board.id)
+}
+
 async fn ensure_demo_app(
     db: &Database,
     existing: &[AppRecord],

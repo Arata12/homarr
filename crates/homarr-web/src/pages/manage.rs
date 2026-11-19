@@ -5,16 +5,19 @@ use axum::{
 };
 use homarr_auth::{AuthSession, OptionalAuth};
 use homarr_db::repos::{
-    api_keys, apps, assistant, boards, custom_widgets, groups, integrations, invites, settings,
-    users,
+    api_keys, apps, assistant, boards, custom_widgets, groups, integrations, invites,
+    search_engines, users,
 };
 use homarr_definitions::{integration::all_integration_defs, WidgetKind};
-use homarr_widgets::{all_widget_metadata, get_widget_metadata, render_widget_html};
-use html_escape::encode_text;
+use homarr_widgets::{all_widget_metadata, get_widget_metadata, render_widget_html, safe_url};
+use html_escape::{encode_double_quoted_attribute as encode_attr, encode_text};
 use serde_json::json;
 
+use super::board_editor::script_json;
+use super::manage_extra::integration_defs_map_json;
+pub use super::manage_extra::{api_reference_page, search_engines_page, settings_page};
 use crate::icons;
-use crate::layout::{render_page, PageContext};
+use crate::layout::{build_spotlight_items, render_page, PageContext, ServerUiSettings};
 use crate::WebState;
 
 struct NavGroup {
@@ -30,6 +33,7 @@ const NAV_GROUPS: &[NavGroup] = &[
             ("/manage/boards", "Boards", icons::LAYOUT_DASHBOARD),
             ("/manage/apps", "Apps", icons::APPS),
             ("/manage/integrations", "Integrations", icons::PLUG),
+            ("/manage/search-engines", "Search Engines", icons::SEARCH),
             ("/manage/custom-widgets", "Custom Widgets", icons::CODE),
             ("/manage/settings", "Settings", icons::SLIDERS),
         ],
@@ -68,7 +72,14 @@ const NAV_GROUPS: &[NavGroup] = &[
     },
 ];
 
-async fn render_manage_shell(
+pub(super) fn empty_table_row(colspan: usize, message: &str) -> String {
+    format!(
+        r#"<tr><td colspan="{colspan}" class="muted" style="text-align:center;padding:24px">{}</td></tr>"#,
+        encode_text(message)
+    )
+}
+
+pub(super) async fn render_manage_shell(
     web: &WebState,
     session: Option<&AuthSession>,
     headers: &HeaderMap,
@@ -79,8 +90,19 @@ async fn render_manage_shell(
     let state = &web.app;
     let locale = web.i18n.negotiate(headers);
     let visible_boards = boards::list_all(&state.db).await.unwrap_or_default();
+    let is_admin = session.is_some_and(AuthSession::is_admin);
+    let spotlight = build_spotlight_items(state, &visible_boards, is_admin, false).await;
+    let ui = ServerUiSettings::load(&state.db).await;
 
-    let mut sidebar = String::from(r#"<aside class="sidebar"><nav class="sidebar-nav">"#);
+    let mut sidebar = format!(
+        r#"<aside class="sidebar" id="manage-sidebar">
+  <div class="sidebar-mobile-head">
+    <strong>Navigation</strong>
+    <button type="button" class="icon-btn icon-btn-sm" onclick="window.closeManageDrawer()" aria-label="Close menu">{close}</button>
+  </div>
+  <nav class="sidebar-nav">"#,
+        close = icons::X
+    );
     for group in NAV_GROUPS {
         sidebar.push_str(&format!(
             r#"<div class="sidebar-group-title">{}</div>"#,
@@ -100,19 +122,31 @@ async fn render_manage_shell(
     sidebar.push_str("</nav></aside>");
 
     let full_body = format!(
-        r#"<div class="manage-shell">{sidebar}<div class="manage-content">{content}</div></div>"#
+        r#"<div class="manage-mobile-bar">
+  <button type="button" class="btn btn-sm" onclick="window.toggleManageDrawer()">{menu}<span>Menu</span></button>
+  <span class="muted" style="font-size:.84rem">{title_enc}</span>
+</div>
+<div class="manage-drawer-backdrop" onclick="window.closeManageDrawer()"></div>
+<div class="manage-shell">{sidebar}<div class="manage-content">{content}</div></div>"#,
+        menu = icons::MENU,
+        title_enc = encode_text(title),
     );
 
-    Html(render_page(PageContext {
+    let mut ctx = PageContext {
         session,
         demo_mode: state.config.demo_mode,
         demo_read_only: state.config.demo_read_only,
         boards: &visible_boards,
+        spotlight_items: &spotlight,
         ..PageContext::minimal(title, &full_body, &locale, &web.i18n)
-    }))
+    };
+    ui.apply(&mut ctx);
+    Html(render_page(ctx))
 }
 
-fn require_admin_or_redirect(session: Option<&AuthSession>) -> Result<&AuthSession, Redirect> {
+pub(super) fn require_admin_or_redirect(
+    session: Option<&AuthSession>,
+) -> Result<&AuthSession, Redirect> {
     match session {
         Some(s) if s.is_admin() => Ok(s),
         _ => Err(Redirect::temporary("/auth/login")),
@@ -124,9 +158,10 @@ pub async fn overview(
     State(web): State<WebState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(redir) = require_admin_or_redirect(session.as_ref()) {
-        return redir.into_response();
-    }
+    let sess = match require_admin_or_redirect(session.as_ref()) {
+        Ok(s) => s,
+        Err(redir) => return redir.into_response(),
+    };
     let state = &web.app;
     let boards_cnt = boards::list_all(&state.db)
         .await
@@ -140,50 +175,147 @@ pub async fn overview(
         .await
         .map(|v| v.len())
         .unwrap_or(0);
-    let users_cnt = users::count(&state.db).await.unwrap_or(0);
+    let users_cnt = usize::try_from(users::count(&state.db).await.unwrap_or(0)).unwrap_or(0);
+    let groups_cnt = groups::list_all(&state.db)
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let invites_cnt = invites::list_all(&state.db)
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let se_cnt = search_engines::list_all(&state.db)
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let cw_cnt = custom_widgets::list_v2(&state.db)
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    let uname = encode_text(sess.username.as_deref().unwrap_or("admin"));
+    let kpis = [
+        (
+            "/manage/boards",
+            "Boards",
+            "Boards",
+            boards_cnt,
+            "kpi-red",
+            icons::LAYOUT_DASHBOARD,
+        ),
+        (
+            "/manage/apps",
+            "Apps",
+            "Resources",
+            apps_cnt,
+            "kpi-blue",
+            icons::APPS,
+        ),
+        (
+            "/manage/integrations",
+            "Integrations",
+            "Resources",
+            ints_cnt,
+            "kpi-green",
+            icons::PLUG,
+        ),
+        (
+            "/manage/users",
+            "Users",
+            "Authentication",
+            users_cnt,
+            "kpi-yellow",
+            icons::USERS,
+        ),
+        (
+            "/manage/users/groups",
+            "Groups",
+            "Authorization",
+            groups_cnt,
+            "kpi-blue",
+            icons::USERS_GROUP,
+        ),
+        (
+            "/manage/users/invites",
+            "Invites",
+            "Authentication",
+            invites_cnt,
+            "kpi-red",
+            icons::MAIL,
+        ),
+        (
+            "/manage/search-engines",
+            "Search Engines",
+            "Resources",
+            se_cnt,
+            "kpi-green",
+            icons::SEARCH,
+        ),
+        (
+            "/manage/custom-widgets",
+            "Custom Widgets",
+            "Widgets",
+            cw_cnt,
+            "kpi-yellow",
+            icons::CODE,
+        ),
+    ];
+
+    let mut kpi_html = String::new();
+    for (href, label, sub, count, color_cls, icon) in kpis {
+        kpi_html.push_str(&format!(
+            r#"<a class="card kpi-card" href="{href}">
+  <div class="kpi-icon {color_cls}">{icon}</div>
+  <div style="flex:1;min-width:0">
+    <div class="metric-big">{count}</div>
+    <div style="font-weight:600;color:var(--text-strong);font-size:.9rem">{label}</div>
+    <div class="muted" style="font-size:.74rem">{sub}</div>
+  </div>
+  <span class="kpi-arrow">{arrow}</span>
+</a>"#,
+            arrow = icons::ARROW_UP_RIGHT
+        ));
+    }
 
     let content = format!(
-        r#"<div class="page-header">
-  <div>
-    <h1 class="page-title">Manage Homarr</h1>
-    <p class="muted" style="margin:4px 0 0">Workspace telemetry, boards, apps, integrations, and security settings.</p>
+        r#"<div class="card manage-hero">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+    <div>
+      <h1 class="page-title" style="font-size:1.7rem">Welcome back, <span style="color:var(--primary)">{uname}</span></h1>
+      <p class="muted" style="margin:6px 0 0">Everything you manage in Homarr, in one place.</p>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <a class="btn btn-primary" href="/manage/boards">{plus_icon}<span>Create Board</span></a>
+      <a class="btn" href="/manage/apps">{apps_icon}<span>Add App</span></a>
+      <a class="btn" href="/manage/integrations">{plug_icon}<span>Add Integration</span></a>
+      <a class="btn" href="/manage/settings">{sliders_icon}<span>Settings</span></a>
+    </div>
   </div>
 </div>
-<div class="cards-grid">
-  <a class="card kpi-card" href="/manage/boards">
-    <div class="kpi-icon kpi-red">{dash_icon}</div>
-    <div><div class="muted">Boards</div><div class="metric-big">{boards_cnt}</div></div>
-  </a>
-  <a class="card kpi-card" href="/manage/apps">
-    <div class="kpi-icon kpi-blue">{apps_icon}</div>
-    <div><div class="muted">Applications</div><div class="metric-big">{apps_cnt}</div></div>
-  </a>
-  <a class="card kpi-card" href="/manage/integrations">
-    <div class="kpi-icon kpi-green">{plug_icon}</div>
-    <div><div class="muted">Integrations</div><div class="metric-big">{ints_cnt}</div></div>
-  </a>
-  <a class="card kpi-card" href="/manage/users">
-    <div class="kpi-icon kpi-yellow">{users_icon}</div>
-    <div><div class="muted">Users</div><div class="metric-big">{users_cnt}</div></div>
-  </a>
-</div>
+<div class="cards-grid">{kpi_html}</div>
 <div class="card">
-  <h3 style="margin-top:0">Quick Actions</h3>
+  <h3 style="margin-top:0">Tools &amp; System</h3>
   <div style="display:flex;gap:10px;flex-wrap:wrap">
-    <a class="btn btn-primary" href="/manage/boards">{plus_icon}<span>Create Board</span></a>
-    <a class="btn" href="/manage/apps">{apps_icon}<span>Add App</span></a>
-    <a class="btn" href="/manage/integrations">{plug_icon}<span>Add Integration</span></a>
-    <a class="btn" href="/manage/tools/tasks">{clock_icon}<span>Cron Tasks</span></a>
-    <a class="btn" href="/manage/assistant">{sparkles_icon}<span>AI Assistant</span></a>
+    <a class="btn btn-sm" href="/manage/tools/tasks">{clock_icon}<span>Cron Tasks</span></a>
+    <a class="btn btn-sm" href="/manage/tools/docker">{docker_icon}<span>Docker</span></a>
+    <a class="btn btn-sm" href="/manage/tools/logs">{logs_icon}<span>Server Logs</span></a>
+    <a class="btn btn-sm" href="/manage/tools/api-keys">{key_icon}<span>API Keys</span></a>
+    <a class="btn btn-sm" href="/manage/tools/backup">{db_icon}<span>Backup</span></a>
+    <a class="btn btn-sm" href="/manage/assistant">{sparkles_icon}<span>AI Assistant</span></a>
+    <a class="btn btn-sm" href="/reference/api">{book_icon}<span>API Docs</span></a>
   </div>
 </div>"#,
-        dash_icon = icons::LAYOUT_DASHBOARD,
         apps_icon = icons::APPS,
         plug_icon = icons::PLUG,
-        users_icon = icons::USERS,
+        sliders_icon = icons::SLIDERS,
         plus_icon = icons::PLUS,
         clock_icon = icons::CLOCK,
+        docker_icon = icons::DOCKER,
+        logs_icon = icons::FILE_TEXT,
+        key_icon = icons::KEY,
+        db_icon = icons::DATABASE,
         sparkles_icon = icons::SPARKLES,
+        book_icon = icons::BOOK,
     );
     render_manage_shell(
         &web,
@@ -224,6 +356,9 @@ pub async fn boards_page(
             ext = icons::EXTERNAL_LINK,
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(3, "No boards yet. Create your first board above.");
+    }
     let content = format!(
         r#"<div class="page-header"><h1 class="page-title">Boards</h1></div>
 <div class="card">
@@ -262,31 +397,67 @@ pub async fn apps_page(
     let mut rows = String::new();
     for a in &list {
         let name = encode_text(&a.name);
+        let desc = encode_text(a.description.as_deref().unwrap_or(""));
         let id = encode_text(&a.id);
-        let href = encode_text(a.href.as_deref().unwrap_or("-"));
+        let icon = encode_attr(safe_url(&a.icon_url));
+        let href_safe = a.href.as_deref().map(safe_url).filter(|u| *u != "#");
+        let href_cell = match href_safe {
+            Some(u) => format!(
+                r#"<a href="{}" target="_blank" rel="noopener noreferrer"><code>{}</code></a>"#,
+                encode_attr(u),
+                encode_text(u)
+            ),
+            None => r#"<span class="muted">-</span>"#.to_string(),
+        };
+        let app_payload_json = json!({
+            "id": a.id,
+            "name": a.name,
+            "description": a.description,
+            "iconUrl": a.icon_url,
+            "href": a.href,
+            "pingUrl": a.ping_url,
+        })
+        .to_string();
+        let app_payload = encode_attr(&app_payload_json);
         rows.push_str(&format!(
             r#"<tr>
-  <td><strong>{name}</strong></td>
-  <td><code>{href}</code></td>
-  <td><button type="button" class="btn btn-danger btn-sm" data-api-action="/api/apps/{id}" data-method="DELETE">Delete</button></td>
+  <td><div class="table-name-cell"><img class="table-app-icon" src="{icon}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/logo/homarr.svg'" /><div><strong>{name}</strong><div class="muted" style="font-size:.76rem">{desc}</div></div></div></td>
+  <td>{href_cell}</td>
+  <td style="display:flex;gap:6px">
+    <button type="button" class="btn btn-sm" data-edit-app="{app_payload}">Edit</button>
+    <button type="button" class="btn btn-danger btn-sm" data-api-action="/api/apps/{id}" data-method="DELETE">Delete</button>
+  </td>
 </tr>"#
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(3, "No applications yet. Add your first application above.");
+    }
     let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">Applications</h1></div>
+        r##"<div class="page-header"><h1 class="page-title">Applications</h1></div>
 <div class="card">
   <h3 style="margin-top:0">Add Application</h3>
-  <form class="form-grid" data-api-form="/api/apps">
-    <div class="form-row"><label>Name</label><input name="name" required placeholder="Sonarr" /></div>
-    <div class="form-row"><label>Icon URL</label><input name="iconUrl" required value="/logo/homarr.svg" /></div>
-    <div class="form-row"><label>URL</label><input name="href" placeholder="https://sonarr.local" /></div>
-    <div class="form-row"><label>Description</label><input name="description" /></div>
-    <button type="submit" class="btn btn-primary">Add Application</button>
+  <form class="form-grid" style="max-width:none" data-api-form="/api/apps">
+    <div class="settings-two-col">
+      <div class="form-row"><label>Name</label><input name="name" required placeholder="Sonarr" /></div>
+      <div class="form-row"><label>URL</label><input name="href" placeholder="https://sonarr.local" /></div>
+      <div class="form-row"><label>Icon URL</label><input id="app-icon-url-input" name="iconUrl" required value="/logo/homarr.svg" /></div>
+      <div class="form-row"><label>Description</label><input name="description" placeholder="Optional description" /></div>
+    </div>
+    <div class="form-row">
+      <label>Search Bundled Icons</label>
+      <input type="search" data-icon-search="#app-icon-picker" data-icon-target="#app-icon-url-input" placeholder="Type e.g. sonarr, grafana, plex, nextcloud..." autocomplete="off" />
+      <div id="app-icon-picker" class="editor-icon-results"></div>
+    </div>
+    <div><button type="submit" class="btn btn-primary">Add Application</button></div>
   </form>
 </div>
-<div class="card table-wrap">
-  <table><thead><tr><th>Name</th><th>URL</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>
-</div>"#
+<div class="card">
+  <div class="table-toolbar">
+    <input type="search" class="table-search-input" data-table-filter="#apps-table" placeholder="Search applications..." aria-label="Filter applications" />
+  </div>
+  <div class="table-wrap"><table id="apps-table"><thead><tr><th>Application</th><th>URL</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>
+</div>"##
     );
     render_manage_shell(
         &web,
@@ -315,7 +486,7 @@ pub async fn integrations_page(
     for def in all_integration_defs() {
         kinds_opts.push_str(&format!(
             r#"<option value="{}">{}</option>"#,
-            encode_text(def.kind_str),
+            encode_attr(def.kind_str),
             encode_text(def.name)
         ));
     }
@@ -335,21 +506,35 @@ pub async fn integrations_page(
 </tr>"#
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(4, "No integrations connected yet.");
+    }
+    let defs_json = script_json(&integration_defs_map_json());
     let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">Integrations</h1></div>
+        r##"<div class="page-header"><h1 class="page-title">Integrations</h1></div>
 <div class="card">
   <h3 style="margin-top:0">Connect Integration</h3>
-  <form class="form-grid" data-api-form="/api/integrations">
-    <div class="form-row"><label>Kind (92 Supported)</label><select name="kind">{kinds_opts}</select></div>
-    <div class="form-row"><label>Name</label><input name="name" required placeholder="My Sonarr" /></div>
-    <div class="form-row"><label>URL</label><input name="url" required placeholder="http://sonarr:8989" /></div>
-    <div class="form-row"><label>Secrets JSON (optional)</label><input name="secretsJson" placeholder='[{{"kind":"apiKey","value":"..."}}]' /></div>
-    <button type="submit" class="btn btn-primary">Save Integration</button>
+  <form class="form-grid" style="max-width:none" data-api-form="/api/integrations" id="integration-create-form">
+    <div class="settings-two-col">
+      <div class="form-row"><label>Kind (92 Supported)</label><select name="kind" id="integration-kind-select">{kinds_opts}</select></div>
+      <div class="form-row"><label>Name</label><input name="name" required placeholder="My Service" /></div>
+    </div>
+    <div class="form-row"><label>URL</label><input name="url" id="integration-url-input" required placeholder="http://127.0.0.1:8989" /></div>
+    <div id="integration-secret-fields" class="settings-two-col"></div>
+    <details class="editor-details">
+      <summary>Advanced: Raw Secrets JSON</summary>
+      <div class="form-row" style="margin-top:8px"><input name="secretsJson" placeholder='[{{"kind":"apiKey","value":"..."}}]' /></div>
+    </details>
+    <div><button type="submit" class="btn btn-primary">Save Integration</button></div>
   </form>
 </div>
-<div class="card table-wrap">
-  <table><thead><tr><th>Name</th><th>Kind</th><th>URL</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table>
-</div>"#
+<div class="card">
+  <div class="table-toolbar">
+    <input type="search" class="table-search-input" data-table-filter="#integrations-table" placeholder="Search integrations..." aria-label="Filter integrations" />
+  </div>
+  <div class="table-wrap"><table id="integrations-table"><thead><tr><th>Name</th><th>Kind</th><th>URL</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>
+</div>
+<script>window.__HOMARR_INTEGRATION_DEFS__ = {defs_json};</script>"##
     );
     render_manage_shell(
         &web,
@@ -383,18 +568,28 @@ pub async fn users_page(
 <td><button type="button" class="btn btn-danger btn-sm" data-api-action="/api/users/{id}" data-method="DELETE">Delete</button></td></tr>"#
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(4, "No users found.");
+    }
     let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">Users</h1></div>
+        r##"<div class="page-header"><h1 class="page-title">Users</h1></div>
 <div class="card">
   <h3 style="margin-top:0">Create User</h3>
-  <form class="form-grid" data-api-form="/api/users">
-    <div class="form-row"><label>Username</label><input name="name" required minlength="2" /></div>
-    <div class="form-row"><label>Email</label><input name="email" type="email" /></div>
+  <form class="form-grid" style="max-width:none" data-api-form="/api/users">
+    <div class="settings-two-col">
+      <div class="form-row"><label>Username</label><input name="name" required minlength="2" /></div>
+      <div class="form-row"><label>Email</label><input name="email" type="email" /></div>
+    </div>
     <div class="form-row"><label>Password</label><input name="password" type="password" required minlength="4" /></div>
-    <button type="submit" class="btn btn-primary">Create User</button>
+    <div><button type="submit" class="btn btn-primary">Create User</button></div>
   </form>
 </div>
-<div class="card table-wrap"><table><thead><tr><th>Username</th><th>Email</th><th>Provider</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+<div class="card">
+  <div class="table-toolbar">
+    <input type="search" class="table-search-input" data-table-filter="#users-table" placeholder="Search users..." aria-label="Filter users" />
+  </div>
+  <div class="table-wrap"><table id="users-table"><thead><tr><th>Username</th><th>Email</th><th>Provider</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>
+</div>"##
     );
     render_manage_shell(
         &web,
@@ -429,6 +624,9 @@ pub async fn groups_page(
             r#"<tr><td><strong>{name}</strong></td><td><code>{}</code></td><td><button type="button" class="btn btn-danger btn-sm" data-api-action="/api/groups/{id}" data-method="DELETE">Delete</button></td></tr>"#,
             encode_text(&perms)
         ));
+    }
+    if rows.is_empty() {
+        rows = empty_table_row(3, "No groups found.");
     }
     let content = format!(
         r#"<div class="page-header"><h1 class="page-title">Groups</h1></div>
@@ -471,6 +669,9 @@ pub async fn invites_page(
             inv.expiration_date
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(3, "No active invites.");
+    }
     let content = format!(
         r#"<div class="page-header"><h1 class="page-title">Invites</h1></div>
 <div class="card"><button type="button" class="btn btn-primary" data-api-action="/api/invites" data-method="POST">Generate Invite Link</button></div>
@@ -508,6 +709,9 @@ pub async fn custom_widgets_page(
             if cw.enabled { "Enabled" } else { "Disabled" }
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(3, "No custom widgets created yet.");
+    }
     let content = format!(
         r#"<div class="page-header"><h1 class="page-title">Custom Widgets v2</h1></div>
 <div class="card">
@@ -526,35 +730,6 @@ pub async fn custom_widgets_page(
         &headers,
         "/manage/custom-widgets",
         "Custom Widgets",
-        &content,
-    )
-    .await
-    .into_response()
-}
-
-pub async fn settings_page(
-    OptionalAuth(session): OptionalAuth,
-    State(web): State<WebState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(redir) = require_admin_or_redirect(session.as_ref()) {
-        return redir.into_response();
-    }
-    let current = settings::get_all_server_settings(&web.app.db)
-        .await
-        .unwrap_or_default();
-    let pretty = serde_json::to_string_pretty(&current).unwrap_or_default();
-    let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">Server Settings</h1></div>
-<div class="card"><pre class="generic-json">{}</pre></div>"#,
-        encode_text(&pretty)
-    );
-    render_manage_shell(
-        &web,
-        session.as_ref(),
-        &headers,
-        "/manage/settings",
-        "Settings",
         &content,
     )
     .await
@@ -590,9 +765,29 @@ pub async fn docker_page(
 </td></tr>"#
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(
+            4,
+            "No Docker containers reported (or Docker socket is unavailable in this environment).",
+        );
+    }
+    let notice = if containers.is_empty() {
+        r#"<div class="card notice-warn">Docker socket <code>/var/run/docker.sock</code> is unavailable or no containers were returned.</div>"#
+    } else {
+        ""
+    };
     let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">Docker Containers</h1></div>
-<div class="card table-wrap"><table><thead><tr><th>Name</th><th>Image</th><th>State</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        r##"<div class="page-header">
+  <h1 class="page-title">Docker Containers</h1>
+  <button type="button" class="btn btn-sm" onclick="location.reload()">Refresh</button>
+</div>
+{notice}
+<div class="card">
+  <div class="table-toolbar">
+    <input type="search" class="table-search-input" data-table-filter="#docker-table" placeholder="Search containers..." aria-label="Filter containers" />
+  </div>
+  <div class="table-wrap"><table id="docker-table"><thead><tr><th>Name</th><th>Image</th><th>State</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>
+</div>"##
     );
     render_manage_shell(
         &web,
@@ -655,22 +850,41 @@ pub async fn tasks_page(
     let mut rows = String::new();
     for j in &jobs {
         let name = encode_text(&j.name);
+        let name_attr = encode_attr(&j.name);
         let expr = encode_text(&j.cron_expression);
         let desc = encode_text(&j.description);
-        let enabled = if j.is_enabled { "Enabled" } else { "Paused" };
-        let btn = if !j.prevent_manual_execution {
+        let (badge_cls, enabled_lbl, toggle_lbl, next_val) = if j.is_enabled {
+            ("up", "Enabled", "Pause", "false")
+        } else {
+            ("down", "Paused", "Enable", "true")
+        };
+        let run_btn = if !j.prevent_manual_execution {
             format!(
                 r#"<button type="button" class="btn btn-sm" data-api-action="/api/cron-jobs/{name}/trigger" data-method="POST">Run Now</button>"#
             )
         } else {
             String::new()
         };
+        let toggle_btn = format!(
+            r#"<button type="button" class="btn btn-sm" data-cron-toggle="{name_attr}" data-enabled="{next_val}">{toggle_lbl}</button>"#
+        );
         rows.push_str(&format!(
-            r#"<tr><td><strong>{name}</strong><div class="muted" style="font-size:.78rem">{desc}</div></td><td><code>{expr}</code></td><td><span class="badge">{enabled}</span></td><td>{btn}</td></tr>"#
+            r#"<tr>
+  <td><strong>{name}</strong><div class="muted" style="font-size:.78rem">{desc}</div></td>
+  <td><code>{expr}</code></td>
+  <td><span class="badge {badge_cls}">{enabled_lbl}</span></td>
+  <td style="display:flex;gap:6px">{run_btn}{toggle_btn}</td>
+</tr>"#
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(4, "No scheduled jobs registered.");
+    }
     let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">Background Cron Tasks</h1></div>
+        r#"<div class="page-header">
+  <h1 class="page-title">Background Cron Tasks</h1>
+  <button type="button" class="btn btn-sm" onclick="location.reload()">Refresh</button>
+</div>
 <div class="card table-wrap"><table><thead><tr><th>Task</th><th>Schedule</th><th>Status</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>"#
     );
     render_manage_shell(
@@ -694,18 +908,42 @@ pub async fn logs_page(
         return redir.into_response();
     }
     let entries = web.app.logs.recent(150);
-    let mut rows = String::new();
+    let mut lines = String::new();
     for l in &entries {
-        rows.push_str(&format!(
-            r#"<tr><td><code>{}</code></td><td><span class="badge">{}</span></td><td>{}</td></tr>"#,
-            encode_text(&l.timestamp),
-            encode_text(&l.level),
-            encode_text(&l.message),
+        let lvl_lower = l.level.to_ascii_lowercase();
+        let lvl_cls = match lvl_lower.as_str() {
+            "error" => "log-level-error",
+            "warn" | "warning" => "log-level-warn",
+            _ => "log-level-info",
+        };
+        lines.push_str(&format!(
+            r#"<div class="log-line" data-level="{lvl_attr}"><span class="log-time">{time}</span> <span class="badge {lvl_cls}">{lvl}</span> <span class="log-msg">{msg}</span></div>"#,
+            lvl_attr = encode_attr(&lvl_lower),
+            time = encode_text(&l.timestamp),
+            lvl = encode_text(&l.level),
+            msg = encode_text(&l.message),
         ));
     }
+    if lines.is_empty() {
+        lines =
+            r#"<div class="muted" style="padding:16px">No server log entries recorded yet.</div>"#
+                .to_string();
+    }
     let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">Server Logs</h1></div>
-<div class="card table-wrap"><table><thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        r#"<div class="page-header">
+  <h1 class="page-title">Server Logs</h1>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <select id="log-level-filter" aria-label="Filter log level" style="width:auto">
+      <option value="all">All Levels</option>
+      <option value="info">Info</option>
+      <option value="warn">Warn</option>
+      <option value="error">Error</option>
+    </select>
+    <input id="log-text-filter" type="search" placeholder="Search logs..." style="width:220px" aria-label="Search logs" />
+    <button type="button" class="btn btn-sm" onclick="location.reload()">Refresh</button>
+  </div>
+</div>
+<div class="log-terminal" id="log-terminal">{lines}</div>"#
     );
     render_manage_shell(
         &web,
@@ -734,6 +972,9 @@ pub async fn certificates_page(
         rows.push_str(&format!(
             r#"<tr><td>{name}</td><td><button type="button" class="btn btn-danger btn-sm" data-api-action="/api/certificates/{name}" data-method="DELETE">Delete</button></td></tr>"#
         ));
+    }
+    if rows.is_empty() {
+        rows = empty_table_row(2, "No custom trusted certificates uploaded.");
     }
     let content = format!(
         r#"<div class="page-header"><h1 class="page-title">Trusted Certificates</h1></div>
@@ -782,15 +1023,28 @@ pub async fn api_keys_page(
             r#"<tr><td><code>{id}</code></td><td><span class="badge">{ro}</span></td><td><button type="button" class="btn btn-danger btn-sm" data-api-action="/api/api-keys/{id}" data-method="DELETE">Revoke</button></td></tr>"#
         ));
     }
+    if rows.is_empty() {
+        rows = empty_table_row(3, "No API keys created yet.");
+    }
     let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">API Keys</h1></div>
+        r##"<div class="page-header"><h1 class="page-title">API Keys</h1></div>
+<div id="api-key-reveal" class="card api-key-banner" hidden>
+  <h3 style="margin-top:0">New API Key Generated</h3>
+  <p class="muted" style="margin:4px 0 10px">Copy this token now. For security reasons, it will not be displayed again after closing.</p>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <code id="api-key-value" style="padding:8px 12px;font-size:.92rem;user-select:all"></code>
+    <button type="button" class="btn btn-sm btn-primary" id="copy-api-key-btn">{copy}<span>Copy Key</span></button>
+    <button type="button" class="btn btn-sm" onclick="location.reload()">Done &amp; Refresh</button>
+  </div>
+</div>
 <div class="card">
-  <form class="form-grid" data-api-form="/api/api-keys">
+  <form class="form-grid" data-api-form="/api/api-keys" data-reveal-key="#api-key-reveal">
     <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="readOnly" style="width:auto" /> Read-Only Key</label>
     <button type="submit" class="btn btn-primary">Create API Key</button>
   </form>
 </div>
-<div class="card table-wrap"><table><thead><tr><th>Key ID</th><th>Scope</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+<div class="card table-wrap"><table id="api-keys-table"><thead><tr><th>Key ID</th><th>Scope</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>"##,
+        copy = icons::COPY,
     );
     render_manage_shell(
         &web,
@@ -817,6 +1071,15 @@ pub async fn backup_page(
   <h3 style="margin-top:0">Export Full Backup Bundle</h3>
   <p class="muted">Downloads a portable JSON backup containing boards, apps, search engines, groups, and settings.</p>
   <a class="btn btn-primary" href="/api/backup/export" download="homarr-backup.json">Download Backup JSON</a>
+</div>
+<div class="card">
+  <h3 style="margin-top:0">Restore from Backup JSON</h3>
+  <p class="muted">Select an exported <code>homarr-backup.json</code> file or paste JSON below to restore workspace data.</p>
+  <div class="form-grid" style="max-width:none">
+    <div class="form-row"><label>Upload Backup File (.json)</label><input id="backup-file-input" type="file" accept=".json,application/json" /></div>
+    <div class="form-row"><label>Backup JSON Payload</label><textarea id="backup-json-input" rows="6" placeholder='{"boards": [...], "apps": [...]}'></textarea></div>
+    <div><button type="button" class="btn btn-primary" data-restore-backup>Restore Backup</button></div>
+  </div>
 </div>"#;
     render_manage_shell(
         &web,
@@ -890,14 +1153,45 @@ pub async fn about_page(
         return redir.into_response();
     }
     let content = format!(
-        r#"<div class="page-header"><h1 class="page-title">About Homarr</h1></div>
-<div class="card">
-  <p><strong>Version:</strong> v{}</p>
-  <p><strong>Engine:</strong> Pure Rust Workspace (Axum + SQLx + Tokio + Bollard)</p>
-  <p><strong>OpenAPI 3.1 Spec:</strong> <a href="/api/openapi">/api/openapi</a></p>
-  <p><strong>MCP Endpoint:</strong> <code>POST /api/mcp</code></p>
+        r#"<div class="card about-hero">
+  <img src="/logo/homarr.svg" alt="Homarr" style="width:64px;height:64px" />
+  <div>
+    <h1 class="page-title">Homarr <span class="demo-pill">v{version}</span></h1>
+    <p class="muted" style="margin:6px 0 0">Static Pure-Rust Dashboard Server (Axum + SQLx + Tokio + Bollard)</p>
+  </div>
+</div>
+<div class="cards-grid">
+  <div class="card" style="margin-bottom:0">
+    <h3 style="margin-top:0">Runtime &amp; API</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <span class="badge">Distroless musl</span>
+      <span class="badge">SQLite / PostgreSQL</span>
+      <span class="badge">92 Integrations</span>
+      <span class="badge">67 Widgets</span>
+    </div>
+    <p class="muted" style="font-size:.86rem;margin:0">OpenAPI 3.1 spec at <a href="/api/openapi"><code>/api/openapi</code></a> and MCP JSON-RPC 2.0 at <code>POST /api/mcp</code>.</p>
+  </div>
+  <div class="card" style="margin-bottom:0">
+    <h3 style="margin-top:0">Resources</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <a class="btn btn-sm" href="/reference/api">Interactive API Reference</a>
+      <a class="btn btn-sm" href="https://homarr.dev/docs/getting-started" target="_blank" rel="noopener noreferrer">Documentation</a>
+      <a class="btn btn-sm" href="https://github.com/homarr-labs/homarr" target="_blank" rel="noopener noreferrer">GitHub</a>
+    </div>
+  </div>
+</div>
+<div class="card table-wrap" style="margin-top:16px">
+  <h3 style="margin-top:0">Keyboard Shortcuts</h3>
+  <table>
+    <thead><tr><th>Shortcut</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><kbd class="kbd">Ctrl</kbd> + <kbd class="kbd">K</kbd> / <kbd class="kbd">Cmd</kbd> + <kbd class="kbd">K</kbd></td><td>Open Spotlight Search</td></tr>
+      <tr><td><kbd class="kbd">Esc</kbd></td><td>Close modal, Spotlight, or mobile menu drawer</td></tr>
+      <tr><td><kbd class="kbd">&uarr;</kbd> / <kbd class="kbd">&darr;</kbd> / <kbd class="kbd">&crarr;</kbd></td><td>Navigate and open Spotlight results</td></tr>
+    </tbody>
+  </table>
 </div>"#,
-        env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION")
     );
     render_manage_shell(
         &web,
@@ -909,35 +1203,6 @@ pub async fn about_page(
     )
     .await
     .into_response()
-}
-
-pub async fn api_reference_page(
-    OptionalAuth(session): OptionalAuth,
-    State(web): State<WebState>,
-    headers: HeaderMap,
-) -> Html<String> {
-    let state = &web.app;
-    let locale = web.i18n.negotiate(&headers);
-    let body = r#"<div class="card">
-  <h1 class="page-title">Homarr REST, WebSocket &amp; MCP Reference</h1>
-  <p class="muted">Inspect the live OpenAPI 3.1.0 specification at <a href="/api/openapi"><code>/api/openapi</code></a>.</p>
-  <ul>
-    <li><code>GET /api/health/live</code> &middot; <code>GET /api/health/ready</code></li>
-    <li><code>POST /api/auth/login</code> &middot; <code>GET /api/auth/session</code></li>
-    <li><code>GET / POST /api/boards</code> &middot; <code>GET / PATCH / DELETE /api/boards/{id}</code></li>
-    <li><code>GET / POST /api/apps</code> &middot; <code>GET / PATCH / DELETE /api/apps/{id}</code></li>
-    <li><code>GET / POST /api/integrations</code> &middot; <code>POST /api/integrations/{id}/test</code></li>
-    <li><code>GET /api/widgets/catalog</code> &middot; <code>GET /api/widgets/render/{kind}</code></li>
-    <li><code>POST /api/mcp</code> (JSON-RPC 2.0) &middot; <code>GET /websockets</code></li>
-  </ul>
-</div>"#;
-
-    Html(render_page(PageContext {
-        session: session.as_ref(),
-        demo_mode: state.config.demo_mode,
-        demo_read_only: state.config.demo_read_only,
-        ..PageContext::minimal("API Reference", body, &locale, &web.i18n)
-    }))
 }
 
 pub async fn widget_preview_page(
@@ -975,11 +1240,18 @@ pub async fn widget_preview_page(
     );
 
     let locale = web.i18n.negotiate(&headers);
-    Html(render_page(PageContext {
+    let ui = ServerUiSettings::load(&state.db).await;
+    let visible = boards::list_all(&state.db).await.unwrap_or_default();
+    let is_admin = session.as_ref().is_some_and(AuthSession::is_admin);
+    let spotlight = build_spotlight_items(state, &visible, is_admin, false).await;
+    let mut ctx = PageContext {
         session: session.as_ref(),
         demo_mode: state.config.demo_mode,
         demo_read_only: state.config.demo_read_only,
+        boards: &visible,
+        spotlight_items: &spotlight,
         ..PageContext::minimal(&meta.name, &body, &locale, &web.i18n)
-    }))
-    .into_response()
+    };
+    ui.apply(&mut ctx);
+    Html(render_page(ctx)).into_response()
 }

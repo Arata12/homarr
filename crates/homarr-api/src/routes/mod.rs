@@ -1,5 +1,6 @@
 pub mod apps;
 pub mod auth;
+pub mod board_content;
 pub mod boards;
 pub mod health;
 pub mod integrations;

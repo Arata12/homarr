@@ -1,10 +1,15 @@
+pub mod capabilities;
 pub mod clients;
+pub mod error;
 pub mod factory;
+pub mod groups;
 pub mod http_auth;
+pub mod runtime;
 pub mod types;
 
 pub use factory::IntegrationRegistry;
 pub use http_auth::{resolve_declared_http_auth, ResolvedHttpAuth};
+pub use runtime::{IntegrationRuntime, SessionCache};
 pub use types::*;
 
 #[cfg(test)]

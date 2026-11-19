@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+#
+# Release image: packages the static (musl) binaries built by
+# .github/workflows/release.yml. Nothing is compiled here.
+#
+# Expected build context layout:
+#   bin/homarr-server
+#   bin/homarr
+#   bin/homarr-workshop
+#   assets/
+#
+# distroless/static: no shell or package manager. It ships /etc/passwd,
+# /tmp, CA certificates and tzdata, adding only about 2 MB to the image.
+FROM gcr.io/distroless/static-debian13:latest
+
+COPY --chmod=0755 bin/homarr-server bin/homarr bin/homarr-workshop /usr/local/bin/
+COPY assets /app/assets
+
+WORKDIR /app
+
+ENV HOST=0.0.0.0 \
+    PORT=7575 \
+    ASSETS_DIR=/app/assets \
+    STATIC_DATA_DIR=/appdata \
+    DB_DRIVER=sqlite \
+    DB_URL=/appdata/db/db.sqlite
+
+EXPOSE 7575
+VOLUME ["/appdata"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/usr/local/bin/homarr", "healthcheck"]
+CMD ["/usr/local/bin/homarr-server"]

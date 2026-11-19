@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 aes.workspace = true
+async-trait = "0.1"
 base64.workspace = true
 bollard.workspace = true
 cbc.workspace = true

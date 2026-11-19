@@ -47,6 +47,161 @@ pub fn get_widget_metadata(kind: WidgetKind) -> WidgetMetadata {
     }
 }
 
+/// A selectable choice for `select` / `multiSelect` option fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionChoice {
+    pub value: String,
+    pub label: String,
+}
+
+/// Describes one editable widget option so the board editor can generate a form field.
+///
+/// `field_type` is one of: `text`, `textarea`, `number`, `slider`, `switch`, `select`,
+/// `multiSelect`, `textList`, `app`, `location`, `json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionField {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub field_type: String,
+    pub default_value: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub choices: Vec<OptionChoice>,
+}
+
+fn choices(values: &[&str]) -> Vec<OptionChoice> {
+    values
+        .iter()
+        .map(|v| OptionChoice {
+            value: (*v).to_string(),
+            label: (*v).to_string(),
+        })
+        .collect()
+}
+
+/// Builds the option form definition of a widget. Field types are inferred from the widget's
+/// default options and refined by explicit overrides (ranges, enumerations, pickers).
+pub fn widget_option_fields(kind: WidgetKind) -> Vec<OptionField> {
+    let defaults = get_widget_metadata(kind).default_options;
+    let Some(map) = defaults.as_object() else {
+        return Vec::new();
+    };
+    map.iter()
+        .map(|(key, default)| build_option_field(kind, key, default))
+        .collect()
+}
+
+fn build_option_field(kind: WidgetKind, key: &str, default: &Value) -> OptionField {
+    use WidgetKind as W;
+    let mut field = OptionField {
+        key: key.to_string(),
+        field_type: match default {
+            Value::Bool(_) => "switch",
+            Value::Number(_) => "number",
+            Value::String(_) => "text",
+            Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_string) => "textList",
+            Value::Object(o) if o.contains_key("latitude") && o.contains_key("longitude") => {
+                "location"
+            }
+            _ => "json",
+        }
+        .to_string(),
+        default_value: default.clone(),
+        min: None,
+        max: None,
+        step: None,
+        choices: Vec::new(),
+    };
+    match (kind, key) {
+        (W::App, "appId") => field.field_type = "app".into(),
+        (W::Notebook, "content") | (W::Assistant, "placeholder") => {
+            field.field_type = "textarea".into();
+        }
+        (W::SmartHomeControls, "entityIds") | (W::RssFeed, "feedUrls") => {
+            field.field_type = "textList".into();
+        }
+        (W::Bookmarks, "items") | (W::Stats, "metrics") => {
+            field.field_type = "json".into();
+        }
+        (W::Bookmarks, "layout") => {
+            field.field_type = "select".into();
+            field.choices = choices(&["grid", "list"]);
+        }
+        (W::StockPrice, "timeRange") => {
+            field.field_type = "select".into();
+            field.choices = choices(&["1d", "5d", "1mo", "3mo", "6mo", "1y"]);
+        }
+        (W::Releases, "provider") => {
+            field.field_type = "select".into();
+            field.choices = choices(&["github", "gitlab", "dockerhub", "codeberg"]);
+        }
+        (W::Downloads, "columns") => {
+            field.field_type = "multiSelect".into();
+            field.choices = choices(&["name", "progress", "speed", "size", "eta", "state"]);
+        }
+        (W::RssFeed, "maximumAmountOfPosts") => {
+            field.field_type = "slider".into();
+            (field.min, field.max, field.step) = (Some(1.0), Some(50.0), Some(1.0));
+        }
+        (W::Timer, "durationSeconds") => {
+            field.min = Some(1.0);
+            field.max = Some(86_400.0);
+        }
+        _ => {}
+    }
+    field
+}
+
+/// Normalizes submitted option values against the widget's field definitions: coerces types
+/// and drops values that don't match. Unknown keys are kept untouched.
+pub fn sanitize_widget_options(kind: WidgetKind, options: &Value) -> Value {
+    let Some(obj) = options.as_object() else {
+        return Value::Object(Default::default());
+    };
+    let fields = widget_option_fields(kind);
+    let mut out = obj.clone();
+    for f in &fields {
+        let Some(v) = obj.get(&f.key) else { continue };
+        let ok = match f.field_type.as_str() {
+            "switch" => v.is_boolean(),
+            "number" | "slider" => v
+                .as_f64()
+                .is_some_and(|n| f.min.is_none_or(|m| n >= m) && f.max.is_none_or(|m| n <= m)),
+            "text" | "textarea" | "app" => v.is_string(),
+            "select" => v
+                .as_str()
+                .is_some_and(|s| f.choices.is_empty() || f.choices.iter().any(|c| c.value == s)),
+            "multiSelect" => v.as_array().is_some_and(|a| {
+                a.iter().all(|e| {
+                    e.as_str()
+                        .is_some_and(|s| f.choices.iter().any(|c| c.value == s))
+                })
+            }),
+            "textList" => v.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
+            "location" => {
+                v.get("latitude")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|n| (-90.0..=90.0).contains(&n))
+                    && v.get("longitude")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|n| (-180.0..=180.0).contains(&n))
+                    && v.get("name").is_some_and(Value::is_string)
+            }
+            _ => true,
+        };
+        if !ok {
+            out.insert(f.key.clone(), f.default_value.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 fn widget_details(
     kind: WidgetKind,
 ) -> (

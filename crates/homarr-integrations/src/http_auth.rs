@@ -184,10 +184,49 @@ fn resolve_adapter_http_auth(ctx: &IntegrationContext) -> HomarrResult<ResolvedH
         | IntegrationKind::SpeedtestTracker
         | IntegrationKind::Audiobookshelf
         | IntegrationKind::Karakeep
-        | IntegrationKind::Jellystat => {
+        | IntegrationKind::Netalertx => {
             let key = ctx.require_secret("apiKey")?;
             headers.insert("Authorization".to_string(), format!("Bearer {key}"));
             redact_values.push(key.to_string());
+        }
+        IntegrationKind::Jellystat => {
+            let key = ctx.require_secret("apiKey")?;
+            headers.insert("X-API-Token".to_string(), key.to_string());
+            redact_values.push(key.to_string());
+        }
+        IntegrationKind::Tubearchivist => {
+            let key = ctx.require_secret("apiKey")?;
+            headers.insert("Authorization".to_string(), format!("Token {key}"));
+            redact_values.push(key.to_string());
+        }
+        IntegrationKind::Changedetection => {
+            let key = ctx.require_secret("apiKey")?;
+            headers.insert("x-api-key".to_string(), key.to_string());
+            redact_values.push(key.to_string());
+        }
+        IntegrationKind::Stash => {
+            let key = ctx.require_secret("apiKey")?;
+            headers.insert("ApiKey".to_string(), key.to_string());
+            redact_values.push(key.to_string());
+        }
+        IntegrationKind::Homebox => {
+            if let Some(key) = ctx.secret("apiKey") {
+                headers.insert("Authorization".to_string(), format!("Bearer {key}"));
+                redact_values.push(key.to_string());
+            }
+        }
+        IntegrationKind::Umami => {
+            if let Some(key) = ctx.secret("apiKey") {
+                headers.insert("x-umami-api-key".to_string(), key.to_string());
+                redact_values.push(key.to_string());
+            }
+        }
+        IntegrationKind::Prometheus => {
+            if let (Some(user), Some(pass)) = (ctx.secret("username"), ctx.secret("password")) {
+                let enc = B64.encode(format!("{user}:{pass}").as_bytes());
+                headers.insert("Authorization".to_string(), format!("Basic {enc}"));
+                redact_values.push(enc);
+            }
         }
         IntegrationKind::Immich | IntegrationKind::Tandoor | IntegrationKind::Healthchecks => {
             let key = ctx.require_secret("apiKey")?;

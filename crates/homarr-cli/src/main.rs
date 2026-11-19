@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use homarr_auth::hash_password;
@@ -9,6 +10,8 @@ use homarr_db::{
     seed::seed_defaults,
     Database,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 #[derive(Parser)]
 #[command(name = "homarr", version, about = "Homarr administration CLI")]
@@ -19,6 +22,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Checks whether the local Homarr HTTP server responds 200 on `/api/health/live`.
+    Healthcheck {
+        #[arg(long)]
+        url: Option<String>,
+    },
     Users {
         #[command(subcommand)]
         action: UsersCmd,
@@ -72,15 +80,94 @@ fn ensure_sqlite_parent_dir(driver: DatabaseDriver, url: &str) {
     }
 }
 
+fn parse_healthcheck_target(url: Option<&str>) -> Result<(String, u16, String), String> {
+    let default_port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .unwrap_or(7575);
+    let Some(raw) = url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((
+            "127.0.0.1".to_string(),
+            default_port,
+            "/api/health/live".to_string(),
+        ));
+    };
+    let rest = raw
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("Healthcheck URL must start with http://: {raw}"))?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((auth, p)) => (auth, format!("/{p}")),
+        None => (rest, "/api/health/live".to_string()),
+    };
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (h, tail) = after_bracket
+            .split_once(']')
+            .ok_or_else(|| format!("Invalid IPv6 host in healthcheck URL: {raw}"))?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid port in healthcheck URL: {raw}"))?,
+            None => 80,
+        };
+        (h.to_string(), port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| format!("Invalid port in healthcheck URL: {raw}"))?;
+        (h.to_string(), port)
+    } else {
+        (authority.to_string(), 80)
+    };
+    if host.is_empty() {
+        return Err(format!("Missing host in healthcheck URL: {raw}"));
+    }
+    Ok((host, port, path))
+}
+
+async fn run_healthcheck(url: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let (host, port, path) = parse_healthcheck_target(url).map_err(HomarrError::BadRequest)?;
+    let probe = async {
+        let mut stream = TcpStream::connect((host.as_str(), port)).await?;
+        let host_header = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await?;
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).await?;
+        let head = String::from_utf8_lossy(&buf[..n]);
+        let status_line = head.lines().next().unwrap_or("");
+        if status_line.starts_with("HTTP/1.1 200") || status_line.starts_with("HTTP/1.0 200") {
+            Ok::<(), std::io::Error>(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "Unexpected healthcheck status: {status_line}"
+            )))
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), probe)
+        .await
+        .map_err(|_| HomarrError::Upstream("Healthcheck timed out".into()))??;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Commands::Healthcheck { url } = &cli.command {
+        return run_healthcheck(url.as_deref()).await;
+    }
+
     let cfg = AppConfig::from_env()?;
     ensure_sqlite_parent_dir(cfg.db_driver, &cfg.db_url);
     let db = Database::connect(cfg.db_driver, &cfg.db_url).await?;
     db.migrate().await?;
 
     match cli.command {
+        Commands::Healthcheck { .. } => unreachable!(),
         Commands::Users { action } => match action {
             UsersCmd::List => {
                 let all = users::list_all(&db).await?;
@@ -163,4 +250,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_healthcheck_target;
+
+    #[test]
+    fn parses_healthcheck_urls() {
+        assert_eq!(
+            parse_healthcheck_target(Some("http://127.0.0.1:8080/api/health/live")).unwrap(),
+            (
+                "127.0.0.1".to_string(),
+                8080,
+                "/api/health/live".to_string()
+            )
+        );
+        assert_eq!(
+            parse_healthcheck_target(Some("http://[::1]:7575")).unwrap(),
+            ("::1".to_string(), 7575, "/api/health/live".to_string())
+        );
+        assert!(parse_healthcheck_target(Some("https://example.com")).is_err());
+    }
 }

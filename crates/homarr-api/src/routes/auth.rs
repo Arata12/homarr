@@ -9,11 +9,13 @@ use axum::{
 };
 use chrono::Utc;
 use homarr_auth::{
-    build_clear_session_cookie, build_session_cookie, create_api_key, create_session,
-    delete_session, hash_password, session_cookie_name, verify_password, OptionalAuth, RequireAuth,
+    build_clear_session_cookie, build_session_cookie, cookie_secure, create_api_key,
+    create_session, delete_session, hash_password, session_cookie_name, verify_password,
+    OptionalAuth, RequireAuth,
 };
 use homarr_common::{HomarrError, HomarrResult};
-use homarr_db::repos::{api_keys, groups, invites, users};
+use homarr_db::repos::{api_keys, boards, groups, invites, settings, users};
+use homarr_db::seed;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -28,6 +30,7 @@ pub struct LoginBody {
 
 pub async fn login(
     State(state): State<AppState>,
+    req_headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> HomarrResult<impl IntoResponse> {
     let user = users::find_by_name_ci(&state.db, body.name.trim())
@@ -48,6 +51,7 @@ pub async fn login(
         &state.config.auth_cookie_prefix,
         token,
         state.config.auth_session_expiry_secs,
+        cookie_secure(&state.config, &req_headers),
     );
 
     let mut headers = HeaderMap::new();
@@ -74,7 +78,11 @@ pub async fn logout(
     req_headers: HeaderMap,
 ) -> HomarrResult<impl IntoResponse> {
     let cookie_name = session_cookie_name(&state.config.auth_cookie_prefix);
-    if let Some(cookie_hdr) = req_headers.get(COOKIE).and_then(|v| v.to_str().ok()) {
+    for cookie_hdr in req_headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+    {
         for part in cookie_hdr.split(';') {
             if let Some((k, v)) = part.trim().split_once('=') {
                 if k.trim() == cookie_name {
@@ -83,7 +91,10 @@ pub async fn logout(
             }
         }
     }
-    let cleared = build_clear_session_cookie(&state.config.auth_cookie_prefix);
+    let cleared = build_clear_session_cookie(
+        &state.config.auth_cookie_prefix,
+        cookie_secure(&state.config, &req_headers),
+    );
     let mut headers = HeaderMap::new();
     if let Ok(hv) = HeaderValue::from_str(&cleared) {
         headers.insert(SET_COOKIE, hv);
@@ -104,6 +115,10 @@ pub async fn session_info(OptionalAuth(session): OptionalAuth) -> Json<Value> {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterBody {
@@ -111,10 +126,17 @@ pub struct RegisterBody {
     pub password: String,
     pub email: Option<String>,
     pub invite_token: Option<String>,
+    #[serde(default)]
+    pub board_name: Option<String>,
+    #[serde(default)]
+    pub color_scheme: Option<String>,
+    #[serde(default = "default_true")]
+    pub create_starter_board: bool,
 }
 
 pub async fn register(
     State(state): State<AppState>,
+    req_headers: HeaderMap,
     Json(body): Json<RegisterBody>,
 ) -> HomarrResult<impl IntoResponse> {
     let username = body.name.trim().to_string();
@@ -171,6 +193,7 @@ pub async fn register(
     }
 
     if existing_count == 0 {
+        let _ = seed::seed_defaults(&state.db).await;
         let admin_group = match groups::get_by_name(&state.db, "administrators").await? {
             Some(g) => g,
             None => {
@@ -180,6 +203,39 @@ pub async fn register(
             }
         };
         let _ = groups::add_member(&state.db, &admin_group.id, &user.id).await;
+
+        if let Some(scheme) = body
+            .color_scheme
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| matches!(*s, "light" | "dark"))
+        {
+            let _ = users::update_preferences(
+                &state.db,
+                &user.id,
+                users::UpdateUserPreferencesInput {
+                    color_scheme: Some(scheme.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let _ = settings::set_setting(
+                &state.db,
+                "appearance",
+                &json!({ "defaultColorScheme": scheme }),
+            )
+            .await;
+        }
+
+        if body.create_starter_board && boards::list_all(&state.db).await?.is_empty() {
+            let _ = seed::seed_starter_board(
+                &state.db,
+                &user.id,
+                body.board_name.as_deref().unwrap_or("dashboard"),
+                10,
+            )
+            .await?;
+        }
     }
 
     if let Some(iid) = invite_id_to_delete {
@@ -191,6 +247,7 @@ pub async fn register(
         &state.config.auth_cookie_prefix,
         token,
         state.config.auth_session_expiry_secs,
+        cookie_secure(&state.config, &req_headers),
     );
     let mut headers = HeaderMap::new();
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
