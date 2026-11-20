@@ -165,6 +165,42 @@ pub async fn find_by_name_ci(db: &Database, username: &str) -> HomarrResult<Opti
     }
 }
 
+/// Credentials login lookup: only users whose provider is `credentials`.
+pub async fn find_credentials_by_name_ci(
+    db: &Database,
+    username: &str,
+) -> HomarrResult<Option<UserRecord>> {
+    let lower = username.trim().to_lowercase();
+    match db {
+        Database::Sqlite(pool) => {
+            let row = sqlx::query(
+                r#"SELECT * FROM "user" WHERE lower("name") = ? AND "provider" = 'credentials'"#,
+            )
+            .bind(&lower)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_err)?;
+            row.as_ref()
+                .map(map_sqlite_user)
+                .transpose()
+                .map_err(map_sqlx_err)
+        }
+        Database::Postgres(pool) => {
+            let row = sqlx::query(
+                r#"SELECT * FROM "user" WHERE lower("name") = $1 AND "provider" = 'credentials'"#,
+            )
+            .bind(&lower)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_err)?;
+            row.as_ref()
+                .map(map_pg_user)
+                .transpose()
+                .map_err(map_sqlx_err)
+        }
+    }
+}
+
 pub async fn list_all(db: &Database) -> HomarrResult<Vec<UserRecord>> {
     match db {
         Database::Sqlite(pool) => {
@@ -271,6 +307,7 @@ pub async fn update_password(
     Ok(())
 }
 
+/// `None` fields are left unchanged; a changed email clears `email_verified`.
 pub async fn update_profile(
     db: &Database,
     user_id: &str,
@@ -280,7 +317,7 @@ pub async fn update_profile(
 ) -> HomarrResult<()> {
     match db {
         Database::Sqlite(pool) => {
-            sqlx::query(r#"UPDATE "user" SET "name" = coalesce(?, "name"), "email" = ?, "image" = coalesce(?, "image") WHERE "id" = ?"#)
+            sqlx::query(r#"UPDATE "user" SET "name" = coalesce(?1, "name"), "email" = coalesce(?2, "email"), "email_verified" = CASE WHEN ?2 IS NULL OR "email" IS ?2 THEN "email_verified" ELSE NULL END, "image" = coalesce(?3, "image") WHERE "id" = ?4"#)
                 .bind(name)
                 .bind(email)
                 .bind(image)
@@ -290,7 +327,7 @@ pub async fn update_profile(
                 .map_err(map_sqlx_err)?;
         }
         Database::Postgres(pool) => {
-            sqlx::query(r#"UPDATE "user" SET "name" = coalesce($1, "name"), "email" = $2, "image" = coalesce($3, "image") WHERE "id" = $4"#)
+            sqlx::query(r#"UPDATE "user" SET "name" = coalesce($1, "name"), "email" = coalesce($2, "email"), "email_verified" = CASE WHEN $2::text IS NULL OR "email" IS NOT DISTINCT FROM $2::text THEN "email_verified" ELSE NULL END, "image" = coalesce($3, "image") WHERE "id" = $4"#)
                 .bind(name)
                 .bind(email)
                 .bind(image)

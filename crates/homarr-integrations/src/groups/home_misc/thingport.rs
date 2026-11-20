@@ -56,7 +56,15 @@ struct FeaturedPrint {
     category_name: Option<String>,
     #[serde(default)]
     author: Option<Author>,
-    plates: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    thumb_url: Option<String>,
+    plates: Vec<FeaturedPlate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeaturedPlate {
+    #[serde(default)]
+    thumb_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +76,8 @@ struct Featured {
 struct SearchModel {
     id: String,
     name: String,
+    #[serde(default)]
+    thumb_url: Option<String>,
     #[serde(default)]
     category_name: Option<String>,
     #[serde(default)]
@@ -130,8 +140,7 @@ pub struct ThingportModel {
     pub id: String,
     pub name: String,
     pub href: String,
-    /// Thumbnails need the API token, which must never reach the browser; without an image proxy in this crate
-    /// they are not exposed.
+    /// Thumbnails need the API token, which must never reach the browser, so they go through the image proxy.
     pub thumbnail_url: Option<String>,
     pub view_count: f64,
     pub print_count: f64,
@@ -149,7 +158,7 @@ pub struct ThingportFeaturedModel {
     pub category: Option<String>,
     pub view_count: f64,
     pub print_count: f64,
-    /// Always `None`: meshes need the API token and are served through an image proxy in the TS version.
+    /// Always `None`: the TS version serves GLB/STL meshes through the image proxy, which here only passes images.
     pub mesh: Option<Value>,
 }
 
@@ -183,6 +192,33 @@ fn encode(value: &str) -> String {
 
 fn model_href(ctx: &IntegrationContext, id: &str) -> HomarrResult<String> {
     Ok(external_url(ctx, &format!("/models/{}", encode(id)))?.to_string())
+}
+
+/// `apiUrl`: media paths must stay within the integration's `/api` path.
+fn api_url(ctx: &IntegrationContext, relative: &str) -> Option<url::Url> {
+    if !relative.starts_with('/') || relative.starts_with("//") || relative.contains('\\') {
+        return None;
+    }
+    let target = url(ctx, &format!("/api{relative}"), &[]).ok()?;
+    let api_base = url(ctx, "/api", &[]).ok()?;
+    let inside = target.fragment().is_none()
+        && target.origin() == api_base.origin()
+        && target.path().starts_with(&format!("{}/", api_base.path()));
+    inside.then_some(target)
+}
+
+async fn proxy_thumbnail(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+    relative: Option<&str>,
+) -> Option<String> {
+    let target = api_url(ctx, relative?)?;
+    let headers = headers(ctx)
+        .ok()?
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+    super::gotify::proxy_integration_image(rt, ctx, &target, headers).await
 }
 
 async fn fetch<T: serde::de::DeserializeOwned>(
@@ -248,16 +284,23 @@ pub async fn models(
             )))
         }
     };
-    let models: Vec<RawModel> = fetch(rt, ctx, "Thingport models", path, &query).await?;
+    let mut models: Vec<RawModel> = fetch(rt, ctx, "Thingport models", path, &query).await?;
+    models.truncate(limit);
+    let thumbnails = futures_util::future::join_all(
+        models
+            .iter()
+            .map(|model| proxy_thumbnail(rt, ctx, model.thumb_url.as_deref())),
+    )
+    .await;
     models
         .into_iter()
-        .take(limit)
-        .map(|model| {
+        .zip(thumbnails)
+        .map(|(model, thumbnail_url)| {
             Ok(ThingportModel {
                 href: model_href(ctx, &model.id)?,
                 id: model.id,
                 name: model.name,
-                thumbnail_url: None,
+                thumbnail_url,
                 view_count: model.view_count,
                 print_count: model.print_count,
                 created_at: model.created_at,
@@ -283,16 +326,16 @@ pub async fn featured_model(
     let Some(print) = featured.print else {
         return Ok(None);
     };
-    if print.plates.is_empty() {
+    let Some(plate) = print.plates.first() else {
         return Ok(None);
-    }
-    // The mesh and thumbnail URLs require the API token, so (without an image proxy) only the metadata is
-    // returned and `mesh` stays empty;
+    };
+    let thumbnail = plate.thumb_url.as_deref().or(print.thumb_url.as_deref());
+    let thumbnail_url = proxy_thumbnail(rt, ctx, thumbnail).await;
     Ok(Some(ThingportFeaturedModel {
         href: model_href(ctx, &print.id)?,
         id: print.id,
         name: print.name,
-        thumbnail_url: None,
+        thumbnail_url,
         author: print.author.as_ref().and_then(Author::display),
         category: print.category_name,
         view_count: print.view_count,
@@ -366,7 +409,14 @@ pub async fn search(
         &[("q", q(query)), ("limit", q(SEARCH_MODEL_LIMIT))],
     )
     .await?;
-    map_search(ctx, result)
+    let thumbnails = futures_util::future::join_all(
+        result
+            .models
+            .iter()
+            .map(|model| proxy_thumbnail(rt, ctx, model.thumb_url.as_deref())),
+    )
+    .await;
+    map_search(ctx, result, thumbnails)
 }
 
 /// `decodeURI`.
@@ -376,9 +426,14 @@ fn percent_encoding_decode(value: &str) -> String {
         .into_owned()
 }
 
-fn map_search(ctx: &IntegrationContext, result: SearchResponse) -> HomarrResult<Vec<SearchResult>> {
+/// `thumbnails` holds the proxied thumbnail of each model, in order.
+fn map_search(
+    ctx: &IntegrationContext,
+    result: SearchResponse,
+    thumbnails: Vec<Option<String>>,
+) -> HomarrResult<Vec<SearchResult>> {
     let mut out = Vec::new();
-    for model in result.models {
+    for (model, image) in result.models.into_iter().zip(thumbnails) {
         let details = [
             model.author.as_ref().and_then(Author::display),
             model.category_name.clone(),
@@ -392,7 +447,7 @@ fn map_search(ctx: &IntegrationContext, result: SearchResponse) -> HomarrResult<
             id: None,
             link: model_href(ctx, &model.id)?,
             name: model.name,
-            image: None,
+            image,
             text: (!details.is_empty()).then_some(details),
             result_type: None,
             in_library: None,
@@ -490,7 +545,7 @@ mod tests {
             "tags": [{"tag": "test print", "count": 3}]
         }))
         .unwrap();
-        let out = map_search(&ctx(), response).unwrap();
+        let out = map_search(&ctx(), response, vec![None]).unwrap();
         assert_eq!(out[0].link, "https://things.example.com/models/m%201");
         assert_eq!(out[0].text.as_deref(), Some("bob · Boats"));
         assert_eq!(
@@ -502,6 +557,18 @@ mod tests {
             out[2].link,
             "https://things.example.com/models/tags/test%20print"
         );
+    }
+
+    #[test]
+    fn api_url_stays_inside_api_path() {
+        let ctx = ctx();
+        assert_eq!(
+            api_url(&ctx, "/thumbs/a.png?v=1").unwrap().as_str(),
+            "http://thingport.local/api/thumbs/a.png?v=1"
+        );
+        assert!(api_url(&ctx, "/../secret").is_none());
+        assert!(api_url(&ctx, "//evil.example/x").is_none());
+        assert!(api_url(&ctx, "thumbs/a.png").is_none());
     }
 
     #[test]

@@ -16,6 +16,7 @@ use homarr_db::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::routes::auth::throw_if_credentials_disabled;
 use crate::state::AppState;
 
 /// Built-in group every user belongs to; it cannot be renamed, deleted or have members edited.
@@ -43,6 +44,7 @@ pub async fn create_user(
     Json(body): Json<CreateUserBody>,
 ) -> HomarrResult<(StatusCode, Json<Value>)> {
     admin.require_writable(state.demo_read_only_active())?;
+    throw_if_credentials_disabled(&state)?;
     let name = body.name.trim().to_string();
     if name.len() < 2 || body.password.chars().count() < 8 {
         return Err(HomarrError::BadRequest(
@@ -135,6 +137,20 @@ pub async fn update_user(
         }
     }
     let name = body.name.as_deref().map(str::trim);
+    // Upstream ignores an empty email rather than clearing it.
+    let email = body.email.as_deref().filter(|e| !e.is_empty());
+    if name.is_some() || email.is_some() {
+        let target = users::find_by_id(&state.db, &id)
+            .await?
+            .ok_or_else(|| HomarrError::NotFound("User not found".into()))?;
+        let changes_identity = name.is_some_and(|n| target.name.as_deref() != Some(n))
+            || email.is_some_and(|e| target.email.as_deref() != Some(e));
+        if changes_identity && target.provider != "credentials" {
+            return Err(HomarrError::Forbidden(
+                "Username and email can not be changed for users with external providers".into(),
+            ));
+        }
+    }
     if let Some(name) = name {
         // No unique index on "user"."name": case-insensitive duplicates make login ambiguous.
         if let Some(existing) = users::find_by_name_ci(&state.db, name).await? {
@@ -143,14 +159,7 @@ pub async fn update_user(
             }
         }
     }
-    users::update_profile(
-        &state.db,
-        &id,
-        name,
-        body.email.as_deref(),
-        body.image.as_deref(),
-    )
-    .await?;
+    users::update_profile(&state.db, &id, name, email, body.image.as_deref()).await?;
     if let Some(pw) = new_password {
         let hash = hash_password(&pw).await?;
         users::update_password(&state.db, &id, &hash).await?;
@@ -211,7 +220,7 @@ pub async fn update_my_preferences(
             .await?
             .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
         if !can_view_board(&state.db, Some(&session), &board).await? {
-            return Err(HomarrError::Forbidden("Forbidden".into()));
+            return Err(HomarrError::NotFound("Board not found".into()));
         }
     }
     let updated = users::update_preferences(
@@ -356,6 +365,15 @@ pub async fn add_group_member(
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
     reject_reserved_group_id(&state, &id).await?;
+    throw_if_group_members_cannot_be_managed_locally(&state)?;
+    let user = users::find_by_id(&state.db, &user_id)
+        .await?
+        .ok_or_else(|| HomarrError::NotFound("User not found".into()))?;
+    if !is_group_membership_managed_locally(&user.provider) {
+        return Err(HomarrError::Forbidden(
+            "User's provider is not managed locally".into(),
+        ));
+    }
     groups::add_member(&state.db, &id, &user_id).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -367,8 +385,31 @@ pub async fn remove_group_member(
 ) -> HomarrResult<Json<Value>> {
     admin.require_writable(state.demo_read_only_active())?;
     reject_reserved_group_id(&state, &id).await?;
+    throw_if_group_members_cannot_be_managed_locally(&state)?;
     groups::remove_member(&state.db, &id, &user_id).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Upstream `isGroupMembershipManagedLocally`: only credentials users here, since OIDC
+/// (with `AUTH_OIDC_GROUPS_LOCAL_MANAGEMENT`) and LDAP are not implemented in this port.
+fn is_group_membership_managed_locally(provider: &str) -> bool {
+    provider == "credentials"
+}
+
+/// Upstream `canManageGroupMembersLocally`: at least one enabled provider is managed locally.
+fn throw_if_group_members_cannot_be_managed_locally(state: &AppState) -> HomarrResult<()> {
+    if state
+        .config
+        .auth_providers
+        .iter()
+        .any(|p| is_group_membership_managed_locally(p))
+    {
+        Ok(())
+    } else {
+        Err(HomarrError::Forbidden(
+            "Group members cannot be managed locally".into(),
+        ))
+    }
 }
 
 fn reject_reserved_group(group: &GroupRecord) -> HomarrResult<()> {

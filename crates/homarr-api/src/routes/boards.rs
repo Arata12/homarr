@@ -4,11 +4,12 @@ use axum::{
     Json,
 };
 use homarr_auth::{can_view_board, check_board_permission, AuthSession, OptionalAuth, RequireAuth};
+use homarr_common::grid_algorithm::{GridAlgorithmItem, GridItemType};
 use homarr_common::{create_id, HomarrError, HomarrResult};
 use homarr_db::{
     models::{
         FullBoard, GroupPermissionEntry, ItemLayoutRecord, ItemRecord, LayoutRecord,
-        UserPermissionEntry,
+        SectionLayoutRecord, UserPermissionEntry,
     },
     repos::{
         boards::{
@@ -20,10 +21,11 @@ use homarr_db::{
 };
 use homarr_definitions::{
     board::{normalize_board_layout_roles, BoardLayoutNormInput},
+    section::{project_root_sections, LaneGeometry, RootSectionLike},
     BoardPermission, GroupPermissionKey, LayoutRole, WidgetKind,
 };
 use homarr_widgets::sanitize_widget_options;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::board_content::{
@@ -65,6 +67,40 @@ fn ensure_custom_widget_changes_allowed(
                 "Only administrators can add or configure Custom Widgets".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// `boardNameSchema` from packages/validation/src/board.ts.
+fn validate_board_name(name: &str) -> HomarrResult<()> {
+    let valid = (1..=255).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(HomarrError::BadRequest(
+            "Board name must be 1-255 characters of letters, digits, '-' or '_'".into(),
+        ))
+    }
+}
+
+/// `noBoardWithSimilarNameAsync`: names are unique case-insensitively.
+async fn ensure_no_board_with_similar_name(
+    db: &Database,
+    name: &str,
+    ignored_id: Option<&str>,
+) -> HomarrResult<()> {
+    let lower = name.to_lowercase();
+    let taken = boards::list_all(db)
+        .await?
+        .iter()
+        .any(|b| Some(b.id.as_str()) != ignored_id && b.name.to_lowercase() == lower);
+    if taken {
+        return Err(HomarrError::Conflict(
+            "Board with similar name already exists".into(),
+        ));
     }
     Ok(())
 }
@@ -114,10 +150,8 @@ pub async fn create_board(
 ) -> HomarrResult<(StatusCode, Json<FullBoard>)> {
     session.require_writable(state.demo_read_only_active())?;
     session.require_permission(GroupPermissionKey::BoardCreate)?;
-    let name = body.name.trim().to_string();
-    if name.is_empty() {
-        return Err(HomarrError::BadRequest("Board name is required".into()));
-    }
+    let name = body.name;
+    validate_board_name(&name)?;
     if boards::get_by_name(&state.db, &name).await?.is_some() {
         return Err(HomarrError::Conflict(
             "A board with that name already exists".into(),
@@ -177,7 +211,7 @@ pub async fn get_board(
         .await?
         .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
     if !can_view_board(&state.db, session.as_ref(), &full.board).await? {
-        return Err(HomarrError::Forbidden("Board access denied".into()));
+        return Err(HomarrError::NotFound("Board not found".into()));
     }
     redact_permissions_unless_full(&state.db, session.as_ref(), &mut full).await;
     Ok(Json(full))
@@ -192,7 +226,7 @@ pub async fn get_board_by_name(
         .await?
         .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
     if !can_view_board(&state.db, session.as_ref(), &full.board).await? {
-        return Err(HomarrError::Forbidden("Board access denied".into()));
+        return Err(HomarrError::NotFound("Board not found".into()));
     }
     redact_permissions_unless_full(&state.db, session.as_ref(), &mut full).await;
     Ok(Json(full))
@@ -225,25 +259,11 @@ pub async fn update_board(
     };
     check_board_permission(&state.db, Some(&session), &board, required).await?;
 
-    let new_name = match body.name.as_deref().map(str::trim) {
-        Some("") => {
-            return Err(HomarrError::BadRequest("Board name cannot be empty".into()));
-        }
-        Some(trimmed) => {
-            let lower = trimmed.to_lowercase();
-            let taken = boards::list_all(&state.db)
-                .await?
-                .iter()
-                .any(|b| b.id != id && b.name.to_lowercase() == lower);
-            if taken {
-                return Err(HomarrError::Conflict(
-                    "Board with similar name already exists".into(),
-                ));
-            }
-            Some(trimmed)
-        }
-        None => None,
-    };
+    let new_name = body.name.as_deref();
+    if let Some(name) = new_name {
+        validate_board_name(name)?;
+        ensure_no_board_with_similar_name(&state.db, name, Some(id.as_str())).await?;
+    }
     if body.is_public == Some(false) {
         let board_settings = settings::get_setting(&state.db, "board").await?;
         let is_home = ["homeBoardId", "mobileHomeBoardId"]
@@ -701,10 +721,8 @@ pub async fn duplicate_board(
 ) -> HomarrResult<(StatusCode, Json<FullBoard>)> {
     session.require_writable(state.demo_read_only_active())?;
     session.require_permission(GroupPermissionKey::BoardCreate)?;
-    let new_name = body.name.trim();
-    if new_name.is_empty() {
-        return Err(HomarrError::BadRequest("Board name is required".into()));
-    }
+    let new_name = body.name.as_str();
+    validate_board_name(new_name)?;
     let source = boards::get_full_board_by_id(&state.db, &id)
         .await?
         .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
@@ -715,6 +733,7 @@ pub async fn duplicate_board(
         BoardPermission::View,
     )
     .await?;
+    ensure_no_board_with_similar_name(&state.db, new_name, None).await?;
     let source_items = to_item_inputs(&source);
     validate_item_integrations(&state.db, &session, &source_items, &[]).await?;
     ensure_custom_widget_changes_allowed(&session, &source_items, &[])?;
@@ -731,7 +750,7 @@ pub async fn export_board(
         .await?
         .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
     if !can_view_board(&state.db, session.as_ref(), &full.board).await? {
-        return Err(HomarrError::Forbidden("Board access denied".into()));
+        return Err(HomarrError::NotFound("Board not found".into()));
     }
     redact_permissions_unless_full(&state.db, session.as_ref(), &mut full).await;
     Ok(Json(full))
@@ -758,10 +777,8 @@ pub async fn import_board(
 ) -> HomarrResult<(StatusCode, Json<FullBoard>)> {
     session.require_writable(state.demo_read_only_active())?;
     session.require_permission(GroupPermissionKey::BoardCreate)?;
-    let name = body.name.trim().to_string();
-    if name.is_empty() {
-        return Err(HomarrError::BadRequest("Board name is required".into()));
-    }
+    let name = body.name.clone();
+    validate_board_name(&name)?;
     if boards::get_by_name(&state.db, &name).await?.is_some() {
         return Err(HomarrError::Conflict(
             "A board with that name already exists".into(),
@@ -920,7 +937,7 @@ pub async fn import_board(
                 ),
                 None => None,
             };
-            sls.push(homarr_db::models::SectionLayoutRecord {
+            sls.push(SectionLayoutRecord {
                 section_id: new_sid.clone(),
                 layout_id: new_lid,
                 parent_section_id: new_pid,
@@ -1123,45 +1140,381 @@ pub async fn set_board_layouts(
             ));
         }
     }
-    let normalized = normalize_board_layout_roles(&inputs);
-    let _ = boards::replace_layouts(&state.db, &id, &normalized).await?;
+    let mut normalized = normalize_board_layout_roles(&inputs);
+    let (sections, items) = project_layout_changes(&current, &mut normalized)?;
+    let full =
+        boards::replace_layouts_and_content(&state.db, &id, &normalized, &sections, &items).await?;
+    Ok(Json(full))
+}
 
-    // Clamp placements to the (possibly reduced) column counts.
-    let mut full = boards::get_full_board_by_id(&state.db, &id)
-        .await?
-        .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
-    let cols: std::collections::HashMap<String, i32> = full
-        .layouts
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LayoutGeometry {
+    column_count: i32,
+    left_gutter_column_count: i32,
+    right_gutter_column_count: i32,
+}
+
+impl LayoutGeometry {
+    fn of_record(l: &LayoutRecord) -> Self {
+        Self {
+            column_count: l.column_count,
+            left_gutter_column_count: l.left_gutter_column_count,
+            right_gutter_column_count: l.right_gutter_column_count,
+        }
+    }
+
+    fn of_input(l: &BoardLayoutNormInput) -> Self {
+        Self {
+            column_count: l.column_count,
+            left_gutter_column_count: l.left_gutter_column_count,
+            right_gutter_column_count: l.right_gutter_column_count,
+        }
+    }
+
+    /// The original passes geometry without a role, so gutters always count.
+    fn lanes(self) -> LaneGeometry {
+        LaneGeometry {
+            column_count: self.column_count,
+            left_gutter_column_count: self.left_gutter_column_count,
+            right_gutter_column_count: self.right_gutter_column_count,
+            role: LayoutRole::Custom,
+        }
+    }
+}
+
+/// Stored `layout.resize_source` (packages/common/src/layout-resize-source.ts).
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredResizeSource {
+    geometry: LayoutGeometry,
+    elements: Vec<GridAlgorithmItem>,
+    projected_geometry: LayoutGeometry,
+    projected_elements: Vec<GridAlgorithmItem>,
+}
+
+fn sorted_by_id(elements: &[GridAlgorithmItem]) -> Vec<GridAlgorithmItem> {
+    let mut sorted = elements.to_vec();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    sorted
+}
+
+/// Keep the pre-resize arrangement only while the projected placements remain untouched.
+fn get_layout_resize_source(
+    geometry: LayoutGeometry,
+    elements: Vec<GridAlgorithmItem>,
+    serialized: Option<&str>,
+) -> (LayoutGeometry, Vec<GridAlgorithmItem>) {
+    if let Some(stored) =
+        serialized.and_then(|raw| serde_json::from_str::<StoredResizeSource>(raw).ok())
+    {
+        if stored.projected_geometry == geometry
+            && sorted_by_id(&stored.projected_elements) == sorted_by_id(&elements)
+        {
+            return (stored.geometry, stored.elements);
+        }
+    }
+    (geometry, elements)
+}
+
+/// Placements of one layout as grid elements (`getElementsForLayout`).
+fn layout_elements(board: &FullBoard, layout_id: &str) -> Vec<GridAlgorithmItem> {
+    let items = board.items.iter().filter_map(|item| {
+        let l = item.layouts.iter().find(|l| l.layout_id == layout_id)?;
+        Some(GridAlgorithmItem {
+            id: item.id.clone(),
+            item_type: GridItemType::Item,
+            width: l.width,
+            height: l.height,
+            x_offset: l.x_offset,
+            y_offset: l.y_offset,
+            section_id: l.section_id.clone(),
+        })
+    });
+    let sections = board
+        .sections
         .iter()
-        .map(|l| (l.id.clone(), l.column_count))
+        .filter(|s| s.kind == "container")
+        .filter_map(|s| {
+            let l = s.layouts.iter().find(|l| l.layout_id == layout_id)?;
+            Some(GridAlgorithmItem {
+                id: s.id.clone(),
+                item_type: GridItemType::Section,
+                width: l.width,
+                height: l.height,
+                x_offset: l.x_offset,
+                y_offset: l.y_offset,
+                section_id: l.parent_section_id.clone()?,
+            })
+        });
+    items.chain(sections).collect()
+}
+
+#[derive(Clone)]
+struct ProjectedLayout {
+    elements: Vec<GridAlgorithmItem>,
+    resize_source: Option<String>,
+}
+
+/// `getUpdatedBoardLayout`: reflow `elements` from `previous` geometry into `current`.
+fn project_layout(
+    board: &FullBoard,
+    previous: LayoutGeometry,
+    elements: Vec<GridAlgorithmItem>,
+    serialized_source: Option<&str>,
+    current: LayoutGeometry,
+) -> HomarrResult<ProjectedLayout> {
+    let (source_geometry, source_elements) =
+        get_layout_resize_source(previous, elements, serialized_source);
+    let roots: Vec<RootSectionLike> = board
+        .sections
+        .iter()
+        .map(|s| RootSectionLike {
+            id: s.id.clone(),
+            kind: s.kind.clone(),
+            x_offset: s.x_offset,
+            y_offset: s.y_offset,
+        })
         .collect();
-    let mut changed = false;
-    for item in &mut full.items {
-        for pl in &mut item.layouts {
-            if let Some(&c) = cols.get(&pl.layout_id) {
-                if pl.x_offset + pl.width > c {
-                    pl.width = pl.width.min(c);
-                    pl.x_offset = (c - pl.width).max(0);
-                    changed = true;
+    let projected = project_root_sections(
+        &roots,
+        &source_elements,
+        source_geometry.lanes(),
+        current.lanes(),
+    )
+    .ok_or_else(|| HomarrError::Internal("Board has no main canvas root".into()))?;
+    let resize_source = if source_geometry == current {
+        None
+    } else {
+        serde_json::to_string(&StoredResizeSource {
+            geometry: source_geometry,
+            elements: source_elements,
+            projected_geometry: current,
+            projected_elements: projected.clone(),
+        })
+        .ok()
+    };
+    Ok(ProjectedLayout {
+        elements: projected,
+        resize_source,
+    })
+}
+
+fn apply_projection(
+    sections: &mut [SaveBoardSectionInput],
+    items: &mut [SaveBoardItemInput],
+    layout_id: &str,
+    projected: &[GridAlgorithmItem],
+) {
+    for el in projected {
+        match el.item_type {
+            GridItemType::Item => {
+                if let Some(item) = items.iter_mut().find(|i| i.id == el.id) {
+                    item.layouts.retain(|l| l.layout_id != layout_id);
+                    item.layouts.push(ItemLayoutRecord {
+                        item_id: item.id.clone(),
+                        section_id: el.section_id.clone(),
+                        layout_id: layout_id.to_string(),
+                        x_offset: el.x_offset,
+                        y_offset: el.y_offset,
+                        width: el.width,
+                        height: el.height,
+                    });
+                }
+            }
+            GridItemType::Section => {
+                if let Some(section) = sections
+                    .iter_mut()
+                    .find(|s| s.id == el.id && s.kind == "container")
+                {
+                    section.layouts.retain(|l| l.layout_id != layout_id);
+                    section.layouts.push(SectionLayoutRecord {
+                        section_id: section.id.clone(),
+                        layout_id: layout_id.to_string(),
+                        parent_section_id: Some(el.section_id.clone()),
+                        x_offset: el.x_offset,
+                        y_offset: el.y_offset,
+                        width: el.width,
+                        height: el.height,
+                    });
                 }
             }
         }
     }
-    if changed {
-        let sections = to_section_inputs(&full);
-        let items: Vec<SaveBoardItemInput> = full
-            .items
+}
+
+/// Placement half of `saveLayouts` (packages/api/src/router/board.ts): added layouts get the
+/// (possibly resized) Base placements reflowed into their geometry, resized layouts reflow their
+/// own placements, and placements of removed layouts are dropped. Sets the resize source of
+/// every resized layout in `layouts`.
+fn project_layout_changes(
+    current: &FullBoard,
+    layouts: &mut [BoardLayoutNormInput],
+) -> HomarrResult<(Vec<SaveBoardSectionInput>, Vec<SaveBoardItemInput>)> {
+    let kept: std::collections::HashSet<String> = layouts.iter().map(|l| l.id.clone()).collect();
+    let mut sections = to_section_inputs(current);
+    let mut items = to_item_inputs(current);
+    for s in &mut sections {
+        s.layouts.retain(|l| kept.contains(&l.layout_id));
+    }
+    for i in &mut items {
+        i.layouts.retain(|l| kept.contains(&l.layout_id));
+    }
+
+    let base = current
+        .layouts
+        .iter()
+        .find(|l| l.role == LayoutRole::Base.as_str())
+        .ok_or_else(|| HomarrError::Internal("Board must have a Base layout".into()))?;
+    let base_geometry = LayoutGeometry::of_record(base);
+    let requested_base_geometry = layouts
+        .iter()
+        .find(|l| l.id == base.id)
+        .map_or(base_geometry, LayoutGeometry::of_input);
+    let resized_base = if requested_base_geometry == base_geometry {
+        None
+    } else {
+        Some(project_layout(
+            current,
+            base_geometry,
+            layout_elements(current, &base.id),
+            base.resize_source.as_deref(),
+            requested_base_geometry,
+        )?)
+    };
+    let base_source_elements = match &resized_base {
+        Some(p) => p.elements.clone(),
+        None => layout_elements(current, &base.id),
+    };
+
+    for layout in layouts.iter_mut() {
+        let target = LayoutGeometry::of_input(layout);
+        let projection = match current.layouts.iter().find(|l| l.id == layout.id) {
+            // Added layouts start without a resize source, like the original insert.
+            None => project_layout(
+                current,
+                requested_base_geometry,
+                base_source_elements.clone(),
+                None,
+                target,
+            )?,
+            Some(existing) => {
+                let previous = LayoutGeometry::of_record(existing);
+                if previous == target {
+                    continue;
+                }
+                let projection = match &resized_base {
+                    Some(p) if existing.id == base.id => p.clone(),
+                    _ => project_layout(
+                        current,
+                        previous,
+                        layout_elements(current, &existing.id),
+                        existing.resize_source.as_deref(),
+                        target,
+                    )?,
+                };
+                layout.resize_source = projection.resize_source.clone();
+                projection
+            }
+        };
+        apply_projection(&mut sections, &mut items, &layout.id, &projection.elements);
+    }
+    Ok((sections, items))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use homarr_core::DatabaseDriver;
+
+    #[tokio::test]
+    async fn saving_layouts_projects_base_placements_into_added_and_resized_layouts() {
+        let db = Database::connect(DatabaseDriver::Sqlite, "sqlite::memory:")
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        let board = boards::create_board_with_defaults(
+            &db,
+            CreateBoardInput {
+                id: None,
+                name: "projection".into(),
+                is_public: false,
+                creator_id: None,
+                column_count: 10,
+            },
+        )
+        .await
+        .unwrap();
+        let base = board.layouts.iter().find(|l| l.role == "base").unwrap();
+        let root = board.sections.iter().find(|s| s.kind == "empty").unwrap();
+        let item = SaveBoardItemInput {
+            id: "wide".into(),
+            kind: "clock".into(),
+            options: json!({}),
+            advanced_options: json!({}),
+            layouts: vec![ItemLayoutRecord {
+                item_id: "wide".into(),
+                section_id: root.id.clone(),
+                layout_id: base.id.clone(),
+                x_offset: 6,
+                y_offset: 0,
+                width: 4,
+                height: 1,
+            }],
+            integration_ids: vec![],
+        };
+        let current =
+            boards::save_board_content(&db, &board.board.id, &to_section_inputs(&board), &[item])
+                .await
+                .unwrap();
+
+        let mut layouts: Vec<BoardLayoutNormInput> = current
+            .layouts
             .iter()
-            .map(|i| SaveBoardItemInput {
-                id: i.id.clone(),
-                kind: i.kind.clone(),
-                options: i.options.clone(),
-                advanced_options: i.advanced_options.clone(),
-                layouts: i.layouts.clone(),
-                integration_ids: i.integration_ids.clone(),
+            .map(|l| BoardLayoutNormInput {
+                id: l.id.clone(),
+                name: l.name.clone(),
+                breakpoint: l.breakpoint,
+                column_count: if l.id == base.id { 5 } else { l.column_count },
+                left_gutter_column_count: 0,
+                right_gutter_column_count: 0,
+                role: LayoutRole::from_str_opt(&l.role),
+                resize_source: None,
             })
             .collect();
-        full = boards::save_board_content(&state.db, &id, &sections, &items).await?;
+        layouts.push(BoardLayoutNormInput {
+            id: "added".into(),
+            name: "Tablet".into(),
+            breakpoint: 1200,
+            column_count: 3,
+            left_gutter_column_count: 0,
+            right_gutter_column_count: 0,
+            role: Some(LayoutRole::Custom),
+            resize_source: None,
+        });
+
+        let (sections, items) = project_layout_changes(&current, &mut layouts).unwrap();
+        let placement = |layout_id: &str| {
+            items[0]
+                .layouts
+                .iter()
+                .find(|l| l.layout_id == layout_id)
+                .cloned()
+                .unwrap()
+        };
+        let resized = placement(&base.id);
+        assert!(resized.x_offset + resized.width <= 5, "{resized:?}");
+        let added = placement("added");
+        assert_eq!(added.section_id, root.id);
+        assert!(added.x_offset + added.width <= 3, "{added:?}");
+        let base_input = layouts.iter().find(|l| l.id == base.id).unwrap();
+        assert!(base_input.resize_source.is_some());
+
+        let saved =
+            boards::replace_layouts_and_content(&db, &board.board.id, &layouts, &sections, &items)
+                .await
+                .unwrap();
+        assert_eq!(saved.layouts.len(), 3);
+        assert_eq!(saved.items[0].layouts.len(), 2);
     }
-    Ok(Json(full))
 }

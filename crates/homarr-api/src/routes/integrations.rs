@@ -127,7 +127,7 @@ pub async fn get_integration(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> HomarrResult<Json<IntegrationRecord>> {
-    check_integration_permission(&state.db, &session, &id, IntegrationPermission::Use).await?;
+    check_integration_permission(&state.db, &session, &id, IntegrationPermission::Full).await?;
     let rec = integrations::get_by_id(&state.db, &id)
         .await?
         .ok_or_else(|| HomarrError::NotFound("Integration not found".into()))?;

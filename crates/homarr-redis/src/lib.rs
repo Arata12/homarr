@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,11 @@ pub struct PubSubEnvelope {
 struct MemoryRedis {
     kv: RwLock<HashMap<String, (String, Option<Instant>)>>,
     sets: RwLock<HashMap<String, HashSet<String>>>,
+    writes: AtomicU64,
 }
+
+/// Expired keys that are never read again are swept once every this many writes.
+const SWEEP_EVERY_WRITES: u64 = 256;
 
 impl MemoryRedis {
     async fn get(&self, key: &str) -> Option<String> {
@@ -37,11 +42,13 @@ impl MemoryRedis {
     }
 
     async fn set_ex(&self, key: &str, value: &str, ttl_secs: u64) {
-        let deadline = Instant::now() + Duration::from_secs(ttl_secs);
-        self.kv
-            .write()
-            .await
-            .insert(key.to_string(), (value.to_string(), Some(deadline)));
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(ttl_secs);
+        let mut guard = self.kv.write().await;
+        if (self.writes.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(SWEEP_EVERY_WRITES) {
+            guard.retain(|_, (_, exp)| exp.is_none_or(|deadline| now < deadline));
+        }
+        guard.insert(key.to_string(), (value.to_string(), Some(deadline)));
     }
 
     async fn del(&self, key: &str) {
@@ -306,6 +313,16 @@ mod tests {
         let env = rx.recv().await.unwrap();
         assert_eq!(env.channel, "ch");
         assert_eq!(env.payload, "hello");
+    }
+
+    #[tokio::test]
+    async fn in_memory_redis_sweeps_unread_expired_keys() {
+        let mem = MemoryRedis::default();
+        for i in 0..SWEEP_EVERY_WRITES {
+            mem.set_ex(&format!("k{i}"), "v", 0).await;
+        }
+        // The last write triggered a sweep, so only that key remains.
+        assert_eq!(mem.kv.read().await.len(), 1);
     }
 
     #[tokio::test]

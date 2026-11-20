@@ -181,7 +181,7 @@ pub async fn board_settings_page(
         .await
         .is_err()
     {
-        return (StatusCode::FORBIDDEN, "Board modify permission required").into_response();
+        return (StatusCode::NOT_FOUND, "Board not found").into_response();
     }
 
     let locale = web.i18n.negotiate(&headers);

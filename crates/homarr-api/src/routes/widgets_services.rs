@@ -138,12 +138,16 @@ pub async fn resolve_widget(
     Ok(Json(data))
 }
 
-pub async fn list_custom_widgets(State(state): State<AppState>) -> HomarrResult<Json<Value>> {
+pub async fn list_custom_widgets(
+    RequireAdmin(_admin): RequireAdmin,
+    State(state): State<AppState>,
+) -> HomarrResult<Json<Value>> {
     let items = cw_repo::list_v2(&state.db).await?;
     Ok(Json(json!({ "items": items })))
 }
 
 pub async fn get_custom_widget(
+    RequireAdmin(_admin): RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> HomarrResult<Json<Value>> {

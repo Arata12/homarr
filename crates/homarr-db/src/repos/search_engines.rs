@@ -16,7 +16,49 @@ pub struct SearchEngineInput {
     pub integration_id: Option<String>,
 }
 
+/// Mirrors packages/validation/src/search-engine.ts; drops fields that don't belong to the type.
+pub fn validate_input(mut input: SearchEngineInput) -> HomarrResult<SearchEngineInput> {
+    fn bad<T>(m: &str) -> HomarrResult<T> {
+        Err(HomarrError::BadRequest(m.to_string()))
+    }
+    let name_len = input.name.chars().count();
+    if name_len == 0 || name_len > 64 {
+        return bad("name must be 1-64 characters");
+    }
+    let short_len = input.short.trim().chars().count();
+    if short_len == 0 || short_len > 8 {
+        return bad("short must be 1-8 characters");
+    }
+    if input.icon_url.is_empty() {
+        return bad("iconUrl is required");
+    }
+    if input
+        .description
+        .as_deref()
+        .is_some_and(|d| d.chars().count() > 512)
+    {
+        return bad("description must be at most 512 characters");
+    }
+    match input.kind.as_str() {
+        "generic" => {
+            let tpl = input.url_template.as_deref().unwrap_or_default();
+            let lower = tpl.to_ascii_lowercase();
+            // Only http(s): blocks javascript: and other schemes.
+            if !(lower.starts_with("http://") || lower.starts_with("https://"))
+                || !tpl.contains("%s")
+            {
+                return bad("urlTemplate must be an http(s) URL containing %s");
+            }
+            input.integration_id = None;
+        }
+        "fromIntegration" => input.url_template = None,
+        _ => return bad("type must be 'generic' or 'fromIntegration'"),
+    }
+    Ok(input)
+}
+
 pub async fn create(db: &Database, input: SearchEngineInput) -> HomarrResult<SearchEngineRecord> {
+    let input = validate_input(input)?;
     let id = input.id.unwrap_or_else(create_id);
     let short = input.short.trim().to_lowercase();
     match db {
@@ -166,6 +208,7 @@ pub async fn update(
     id: &str,
     input: SearchEngineInput,
 ) -> HomarrResult<SearchEngineRecord> {
+    let input = validate_input(input)?;
     let short = input.short.trim().to_lowercase();
     let affected = match db {
         Database::Sqlite(pool) => sqlx::query(

@@ -294,7 +294,8 @@ async fn import_entities(
             summary.search_engines.skipped += 1;
             continue;
         }
-        search_engines::create(
+        // Invalid legacy entries are skipped instead of aborting the whole import.
+        let result = search_engines::create(
             db,
             search_engines::SearchEngineInput {
                 id: Some(se.id.clone()),
@@ -310,7 +311,15 @@ async fn import_entities(
                     .filter(|id| known_integrations.contains(id)),
             },
         )
-        .await?;
+        .await;
+        match result {
+            Ok(_) => {}
+            Err(HomarrError::BadRequest(_)) => {
+                summary.search_engines.skipped += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
         created.push(Created::SearchEngine(se.id.clone()));
         summary.search_engines.imported += 1;
     }

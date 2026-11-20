@@ -105,9 +105,9 @@ pub async fn check_board_permission(
     if required == BoardPermission::View && board.is_public {
         return Ok(());
     }
-    let sess = session.ok_or_else(|| {
-        HomarrError::Unauthorized("Authentication required to access this board".to_string())
-    })?;
+    // Every denial is NOT_FOUND so callers cannot probe for private boards (board-access.ts).
+    let not_found = || HomarrError::NotFound("Board not found".to_string());
+    let sess = session.ok_or_else(not_found)?;
 
     if sess.has_permission(required.global_equivalent()) {
         return Ok(());
@@ -136,11 +136,7 @@ pub async fn check_board_permission(
         }
     }
 
-    Err(HomarrError::Forbidden(format!(
-        "Missing '{}' permission for board '{}'",
-        required.as_str(),
-        board.name
-    )))
+    Err(not_found())
 }
 
 pub async fn check_integration_permission(

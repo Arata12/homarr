@@ -35,17 +35,14 @@ pub async fn login(
     req_headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> HomarrResult<impl IntoResponse> {
-    let user = users::find_by_name_ci(&state.db, body.name.trim())
+    throw_if_credentials_disabled(&state)?;
+    let invalid = || HomarrError::Unauthorized("Invalid username or password".into());
+    let user = users::find_credentials_by_name_ci(&state.db, body.name.trim())
         .await?
-        .ok_or_else(|| HomarrError::Unauthorized("Invalid username or password".into()))?;
-    let hash = user
-        .password
-        .as_deref()
-        .ok_or_else(|| HomarrError::Unauthorized("User has no password configured".into()))?;
+        .ok_or_else(invalid)?;
+    let hash = user.password.as_deref().ok_or_else(invalid)?;
     if !verify_password(&body.password, hash).await? {
-        return Err(HomarrError::Unauthorized(
-            "Invalid username or password".into(),
-        ));
+        return Err(invalid());
     }
 
     let token = create_session(&state.db, &user.id, state.config.auth_session_expiry_secs).await?;
@@ -73,6 +70,22 @@ pub async fn login(
             }
         })),
     ))
+}
+
+/// Mirrors upstream `throwIfCredentialsDisabled`: credentials login/registration obey `AUTH_PROVIDERS`.
+pub(crate) fn throw_if_credentials_disabled(state: &AppState) -> HomarrResult<()> {
+    if state
+        .config
+        .auth_providers
+        .iter()
+        .any(|p| p == "credentials")
+    {
+        Ok(())
+    } else {
+        Err(HomarrError::Forbidden(
+            "Credentials provider is disabled".into(),
+        ))
+    }
 }
 
 pub async fn logout(
@@ -141,6 +154,7 @@ pub async fn register(
     req_headers: HeaderMap,
     Json(body): Json<RegisterBody>,
 ) -> HomarrResult<impl IntoResponse> {
+    throw_if_credentials_disabled(&state)?;
     let username = body.name.trim().to_string();
     if username.len() < 2 || body.password.chars().count() < 8 {
         return Err(HomarrError::BadRequest(

@@ -1,13 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use aes::Aes256;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use homarr_common::{
-    create_id, is_http_url, validate_outbound_url, HomarrError, HomarrResult, SecretCrypto,
-};
+use homarr_common::{is_http_url, validate_outbound_url, HomarrError, HomarrResult, SecretCrypto};
 use homarr_core::HttpClientFactory;
 use homarr_redis::RedisStore;
 use rand::RngCore;
@@ -125,6 +123,11 @@ impl ImageProxyService {
         trusted_origin: Option<String>,
     ) -> HomarrResult<String> {
         let _ = validate_outbound_url(url, trusted_origin.as_deref())?;
+        // Deterministic id (keyed HMAC of url + headers + origin) so refreshes reuse the same proxy URL.
+        let sorted_headers: BTreeMap<&String, &String> = headers.iter().collect();
+        let id_input = serde_json::to_string(&(url, &sorted_headers, &trusted_origin))
+            .map_err(|err| HomarrError::Internal(format!("Image id encode failed: {err}")))?;
+        let id = self.sign_token(&format!("image-id:{id_input}"))?;
         let payload = StoredImagePayload {
             url: url.to_string(),
             headers,
@@ -133,7 +136,6 @@ impl ImageProxyService {
         let json = serde_json::to_string(&payload)
             .map_err(|err| HomarrError::Internal(format!("Image payload encode failed: {err}")))?;
         let encrypted = self.encrypt_payload(&json)?;
-        let id = create_id();
         self.redis
             .set_string_ex(&format!("img:{id}"), &encrypted, FORWARDED_IMAGE_TTL_SECS)
             .await?;

@@ -60,8 +60,9 @@ const BUILTIN_JOBS: &[JobSpec] = &[
     JobSpec {
         name: "iconsUpdater",
         description: "Syncs upstream Homarr, selfh.st, Papirus, and SimpleIcons catalogs",
-        default_cron: "0 0 3 * * *",
-        run_on_start: false,
+        // Original EVERY_WEEK ("0 0 * * 1", Monday midnight) with runOnStart so fresh installs get icons.
+        default_cron: "0 0 0 * * Mon",
+        run_on_start: true,
         prevent_manual_execution: false,
         prevent_custom_interval: false,
         hidden: false,
@@ -69,7 +70,7 @@ const BUILTIN_JOBS: &[JobSpec] = &[
     JobSpec {
         name: "analytics",
         description: "Computes internal instance usage snapshot",
-        default_cron: "0 0 0 * * 0",
+        default_cron: "0 0 0 * * Sun",
         run_on_start: false,
         prevent_manual_execution: true,
         prevent_custom_interval: true,
@@ -487,13 +488,25 @@ impl TaskScheduler {
             }
         }
 
+        // Concurrent like the original's Promise.allSettled, bounded so many apps can't open
+        // hundreds of sockets at once.
+        let permits = Arc::new(tokio::sync::Semaphore::new(10));
+        let mut pings = tokio::task::JoinSet::new();
         for url in urls.into_iter().take(100) {
-            let res = self.services.ping.ping_url(&url).await;
-            let _ = self
-                .redis
-                .publish_json(RedisStore::PING_EVENTS_CHANNEL, &res)
-                .await;
+            let (ping, redis, permits) = (
+                self.services.ping.clone(),
+                self.redis.clone(),
+                permits.clone(),
+            );
+            pings.spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                let res = ping.ping_url(&url).await;
+                let _ = redis
+                    .publish_json(RedisStore::PING_EVENTS_CHANNEL, &res)
+                    .await;
+            });
         }
+        while pings.join_next().await.is_some() {}
         Ok(())
     }
 
@@ -663,6 +676,13 @@ mod tests {
             "*/15 * * * * *"
         );
         assert!(normalize_cron_expression("not-a-cron").is_err());
+        for job in BUILTIN_JOBS {
+            assert!(
+                next_run_timestamp(job.default_cron, Utc::now()).is_some(),
+                "{} has an unparseable default cron",
+                job.default_cron
+            );
+        }
     }
 
     #[tokio::test]
