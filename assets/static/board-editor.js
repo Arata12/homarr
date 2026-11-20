@@ -93,7 +93,7 @@
   function placement(it) {
     let p = it.p[curLayoutId];
     if (!p) {
-      const w = clamp(2, 1, curCols());
+      const w = clamp(2, 1, sectionCols(it.sectionId));
       p = [0, 0, w, 1, 0];
       it.p[curLayoutId] = p;
     }
@@ -140,15 +140,19 @@
 
   /** Vertical compaction around an optional pinned rectangle. Returns Map id -> [x,y,w,h]. */
   function settle(sectionId, pinned, excludeId) {
-    const cols = curCols();
+    const cols = sectionCols(sectionId);
     const list = itemsIn(sectionId, pinned ? pinned.id : excludeId).filter(
       (it) => !(pinned && it.id === pinned.id)
     );
     list.sort((a, b) => placement(a)[1] - placement(b)[1] || placement(a)[0] - placement(b)[0]);
-    const placed = [];
+    // Container sections placed in this grid are fixed obstacles: items never land on them.
+    const fixed = containerRects(sectionId, curLayoutId);
+    const placed = fixed.slice();
     const out = new Map();
     if (pinned) {
-      const r = [pinned.x, pinned.y, pinned.w, pinned.h];
+      const w = clamp(pinned.w, 1, cols);
+      const r = [clamp(pinned.x, 0, cols - w), Math.max(0, pinned.y), w, pinned.h];
+      while (fixed.some((f) => overlap(r, f))) r[1]++;
       placed.push(r);
       out.set(pinned.id, r);
     }
@@ -167,14 +171,24 @@
   }
 
   function firstFree(sectionId, w, hh) {
-    const cols = curCols();
+    const occupied = itemsIn(sectionId)
+      .map((it) => placement(it).slice(0, 4))
+      .concat(containerRects(sectionId, curLayoutId));
+    return freeSpot(occupied, sectionCols(sectionId), w, hh);
+  }
+
+  function freeSpot(occupied, cols, w, hh) {
     w = clamp(w, 1, cols);
-    const occupied = itemsIn(sectionId).map((it) => placement(it).slice(0, 4));
     for (let y = 0; ; y++) {
       for (let x = 0; x <= cols - w; x++) {
         if (!occupied.some((r) => overlap([x, y, w, hh], r))) return [x, y, w, hh];
       }
     }
+  }
+
+  /** Top-left spot in another layout that does not cover a container section there. */
+  function baseSpot(sectionId, layoutId, w, hh) {
+    return freeSpot(containerRects(sectionId, layoutId), sectionCols(sectionId, layoutId), w, hh);
   }
 
   // -------------------------------------------------------------- DOM access
@@ -183,6 +197,36 @@
   }
   function sectionEl(id) {
     return document.querySelector('.board-section[data-section-id="' + CSS.escape(id) + '"]');
+  }
+  function layoutIndex(layoutId) {
+    return Math.max(0, layouts.findIndex((l) => l.id === layoutId));
+  }
+  /** A container's server-rendered cell [x, y, w, h] in a layout (from its --x{i}.. vars). */
+  function containerCell(el, layoutId) {
+    const i = layoutIndex(layoutId);
+    const r = ["x", "y", "w", "h"].map((k) => parseInt(el.style.getPropertyValue("--" + k + i), 10));
+    return r.every((n) => Number.isFinite(n)) ? r : null;
+  }
+  /** Cells of the container sections placed directly in a section's grid. */
+  function containerRects(sectionId, layoutId) {
+    const out = [];
+    document.querySelectorAll(".board-container[data-section-id]").forEach((el) => {
+      const parent = el.parentElement && el.parentElement.closest(".board-section");
+      if (!parent || parent.dataset.sectionId !== sectionId) return;
+      const r = containerCell(el, layoutId);
+      if (r) out.push(r);
+    });
+    return out;
+  }
+  /** Column count of a section's grid: the board's, or a container's width in the layout. */
+  function sectionCols(sectionId, layoutId) {
+    const el = sectionEl(sectionId);
+    if (el && el.classList.contains("board-container")) {
+      const r = containerCell(el, layoutId || curLayoutId);
+      if (r && r[2] > 0) return r[2];
+    }
+    const l = layoutId ? layouts.find((x) => x.id === layoutId) : curLayout();
+    return l ? l.columnCount : 12;
   }
   function gridOf(sectionId) {
     const s = sectionEl(sectionId);
@@ -778,7 +822,12 @@
       const secSelect = h(
         "select",
         {},
-        sortedSections().map((s) => h("option", { value: s.id, text: s.name || (s.kind === "category" ? "Category" : "Main") }))
+        sortedSections().map((s) =>
+          h("option", {
+            value: s.id,
+            text: s.name || (s.options && s.options.title) || (s.kind === "category" ? "Category" : s.kind === "container" ? "Container" : "Main"),
+          })
+        )
       );
       secSelect.value = existing ? existing.sectionId : opts.sectionId || sortedSections()[0].id;
       const curP = existing ? placement(existing) : null;
@@ -882,9 +931,8 @@
           it.p[curLayoutId] = firstFree(sectionId, w, hh).concat(1);
           const baseLayout = layouts.find((l) => l.role === "base") || layouts[0];
           if (baseLayout && baseLayout.id !== curLayoutId) {
-            const bw = clamp(w, 1, Math.max(1, baseLayout.columnCount || 1));
             const bh = clamp(hh, 1, MAX_H);
-            it.p[baseLayout.id] = [0, 0, bw, bh, 1];
+            it.p[baseLayout.id] = baseSpot(sectionId, baseLayout.id, w, bh).concat(1);
           }
           items.set(it.id, it);
         } else {
@@ -894,7 +942,7 @@
             it.p[curLayoutId] = firstFree(sectionId, w, hh).concat(1);
           } else if (w !== p[2] || hh !== p[3]) {
             claim(it);
-            const res = settle(sectionId, { id: it.id, x: clamp(p[0], 0, curCols() - w), y: p[1], w, h: hh });
+            const res = settle(sectionId, { id: it.id, x: p[0], y: p[1], w, h: hh });
             for (const [id, r] of res) items.get(id).p[curLayoutId] = r.concat(1);
           }
         }
@@ -1197,9 +1245,8 @@
     copy.p[curLayoutId] = firstFree(src.sectionId, p[2], p[3]).concat(1);
     const baseLayout = layouts.find((l) => l.role === "base") || layouts[0];
     if (baseLayout && baseLayout.id !== curLayoutId) {
-      const bw = clamp(p[2], 1, Math.max(1, baseLayout.columnCount || 1));
       const bh = clamp(p[3], 1, MAX_H);
-      copy.p[baseLayout.id] = [0, 0, bw, bh, 1];
+      copy.p[baseLayout.id] = baseSpot(src.sectionId, baseLayout.id, p[2], bh).concat(1);
     }
     items.set(copy.id, copy);
     await saveAndReload();
@@ -1209,10 +1256,12 @@
   function gridMetrics(grid) {
     const cs = getComputedStyle(grid);
     const rect = grid.getBoundingClientRect();
-    const cols = curCols();
+    const section = grid.closest(".board-section");
+    const cols = section ? sectionCols(section.dataset.sectionId) : curCols();
     const gapX = parseFloat(cs.columnGap) || 12;
     const gapY = parseFloat(cs.rowGap) || 12;
-    const rowH = parseFloat(cs.gridAutoRows) || ROW_FALLBACK;
+    // Container grids size their rows to fit (grid-template-rows); root grids use auto rows.
+    const rowH = parseFloat(cs.gridTemplateRows) || parseFloat(cs.gridAutoRows) || ROW_FALLBACK;
     const colW = (rect.width - gapX * (cols - 1)) / cols;
     return { rect, cols, pitchX: colW + gapX, pitchY: rowH + gapY, gapX, gapY };
   }

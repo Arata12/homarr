@@ -347,10 +347,15 @@ fn render_app(options: &Value, data: &Value) -> String {
             .unwrap_or("/logo/homarr.svg"),
     );
     let href = safe_url(app.get("href").and_then(|v| v.as_str()).unwrap_or("#"));
-    let ping_url = app
-        .get("pingUrl")
-        .or_else(|| app.get("href"))
-        .and_then(|v| v.as_str())
+    // pingUrl is serialized as null when unset; fall back to href like upstream.
+    let non_empty = |key: &str| {
+        app.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let ping_url = non_empty("pingUrl")
+        .or_else(|| non_empty("href"))
         .unwrap_or("");
     let show_title = options
         .get("showTitle")
@@ -1988,5 +1993,21 @@ mod notebook_sanitizer_tests {
         // Unbalanced markup is closed.
         assert_eq!(clean("<ul><li>a</ul>b</p>"), "<ul><li>a</li></ul>b");
         assert_eq!(clean("<p><em>a"), "<p><em>a</em></p>");
+    }
+}
+
+#[cfg(test)]
+mod app_ping_tests {
+    use super::render_app;
+    use serde_json::json;
+
+    #[test]
+    fn null_ping_url_falls_back_to_href() {
+        let html = render_app(
+            &json!({}),
+            &json!({ "app": { "name": "Radarr", "href": "http://10.0.0.5:7878/", "pingUrl": null } }),
+        );
+        assert!(html.contains(r#"data-ping-url="http://10.0.0.5:7878/""#));
+        assert!(html.contains("ping-dot"));
     }
 }

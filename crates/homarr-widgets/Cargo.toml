@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+futures-util.workspace = true
 homarr-common.workspace = true
 homarr-core.workspace = true
 homarr-db.workspace = true

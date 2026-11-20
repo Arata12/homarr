@@ -101,7 +101,7 @@ impl Database {
         };
         if legacy_tables > 0 {
             return Err(HomarrError::Database(
-                "This database was created by Homarr v1 (Drizzle migrations found) and is not                  compatible with Homarr v3. Point DB_URL at a new database."
+                "This database was created by the TypeScript Homarr (Drizzle migrations found) and is not compatible with Homarr v3. Point DB_URL at a new database."
                     .to_string(),
             ));
         }
@@ -179,6 +179,6 @@ mod tests {
             .await
             .unwrap();
         let err = db.migrate().await.unwrap_err();
-        assert!(err.to_string().contains("Homarr v1"), "{err}");
+        assert!(err.to_string().contains("TypeScript Homarr"), "{err}");
     }
 }

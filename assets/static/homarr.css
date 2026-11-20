@@ -682,6 +682,111 @@ body.edit-mode .item-edit-controls {
   display: none;
 }
 
+/* Container sections: cards placed in their parent grid with their own inner grid.
+   The inner grid has as many columns as the container is wide (--w) and --r rows. */
+.grid-item.board-container {
+  padding: 6px;
+  gap: 6px;
+  width: auto;
+}
+
+.board-container-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+}
+
+.board-container-header,
+.board-container-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: 0;
+  padding: 2px 6px;
+  color: var(--text-strong);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.board-container-header {
+  flex: 1;
+  min-width: 0;
+  justify-content: space-between;
+}
+
+.board-container-title,
+.board-container-label {
+  font-size: 0.9rem;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-container-label {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  color: var(--text-strong);
+}
+
+.board-container-open-all {
+  margin-left: auto;
+}
+
+.board-container[data-collapsed="false"] > .board-container-bar > [data-container-toggle] .category-chevron {
+  transform: rotate(180deg);
+}
+
+.board-container-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.board-container[data-scrollable="true"] > .board-container-body {
+  overflow-y: auto;
+}
+
+.board-container .board-grid.container-grid {
+  --board-cols: var(--w, 1);
+  flex: 1;
+  min-height: 0;
+  grid-template-rows: repeat(var(--r, 1), minmax(0, 1fr));
+}
+
+.board-container[data-scrollable="true"] .board-grid.container-grid {
+  grid-template-rows: repeat(var(--r, 1), 108px);
+}
+
+.board-container[data-collapsed="true"] {
+  align-self: start;
+}
+
+.board-container[data-collapsed="true"] > .board-container-body {
+  display: none;
+}
+
+body.edit-mode .board-container[data-collapsed="true"] {
+  align-self: stretch;
+}
+
+body.edit-mode .board-container[data-collapsed="true"] > .board-container-body {
+  display: flex;
+}
+
+body.edit-mode .board-container .board-grid.container-grid {
+  min-height: 0;
+}
+
+body.edit-mode .board-container-open-all {
+  display: none;
+}
+
 /* Responsive Grid Breakpoints */
 @media (max-width: 1024px) {
   .spotlight-trigger {

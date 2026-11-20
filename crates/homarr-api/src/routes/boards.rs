@@ -520,6 +520,49 @@ pub async fn delete_board_item(
 }
 
 #[derive(Deserialize)]
+pub struct SectionCollapseBody {
+    pub collapsed: bool,
+}
+
+/// Stores the caller's collapsed state of a collapsible container (upstream
+/// `section.changeCollapsed`). Per-user UI state, so demo read-only mode does not block it.
+pub async fn set_section_collapsed(
+    RequireAuth(session): RequireAuth,
+    State(state): State<AppState>,
+    Path((board_id, section_id)): Path<(String, String)>,
+    Json(body): Json<SectionCollapseBody>,
+) -> HomarrResult<StatusCode> {
+    session.require_writable(false)?;
+    let full = boards::get_full_board_by_id(&state.db, &board_id)
+        .await?
+        .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?;
+    check_board_permission(
+        &state.db,
+        Some(&session),
+        &full.board,
+        BoardPermission::View,
+    )
+    .await?;
+    let section = full
+        .sections
+        .iter()
+        .find(|s| s.id == section_id)
+        .ok_or_else(|| HomarrError::NotFound("Section not found".into()))?;
+    let collapsible = section
+        .options
+        .get("collapsible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if section.kind != "container" || !collapsible {
+        return Err(HomarrError::BadRequest(
+            "Section cannot be collapsed".into(),
+        ));
+    }
+    boards::set_section_collapse(&state.db, &session.user_id, &section_id, body.collapsed).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddSectionBody {
     pub name: Option<String>,

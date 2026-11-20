@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -6,7 +8,7 @@ use axum::{
 use homarr_api::AppState;
 use homarr_auth::{can_view_board, check_board_permission, AuthSession, OptionalAuth};
 use homarr_db::{
-    models::{BoardRecord, FullBoard, ItemRecord},
+    models::{BoardRecord, FullBoard, LayoutRecord, SectionRecord},
     repos::{boards, settings, users},
 };
 use homarr_definitions::{BoardPermission, WidgetKind};
@@ -340,6 +342,206 @@ fn safe_css_classes(adv: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Per-layout CSS for container sections: their inner row count follows the active breakpoint,
+/// and in edit mode their cell follows the layout picked in the editor (items get that from
+/// `board-editor.js` through `--ex`/`--ey`/...; containers are not editor items).
+fn container_layout_css(layouts: &[&LayoutRecord]) -> String {
+    let mut css = String::new();
+    for (i, layout) in layouts.iter().enumerate() {
+        let rule = format!(".board-container{{--r:var(--r{i})}}");
+        if layout.breakpoint <= 0 || i == 0 {
+            css.push_str(&rule);
+        } else {
+            css.push_str(&format!(
+                "@media (min-width:{}px){{{rule}}}",
+                layout.breakpoint
+            ));
+        }
+        if layout
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            css.push_str(&format!(
+                r#"body[data-edit-layout="{id}"] .board-container{{--ex:var(--x{i});--ey:var(--y{i});--ew:var(--w{i});--eh:var(--h{i});--r:var(--r{i})}}"#,
+                id = layout.id,
+            ));
+        }
+    }
+    css
+}
+
+enum GridNode<'a> {
+    Item(&'a str),
+    Container(&'a SectionRecord),
+}
+
+impl<'a> GridNode<'a> {
+    fn id(&self) -> &'a str {
+        match self {
+            Self::Item(id) => id,
+            Self::Container(sec) => &sec.id,
+        }
+    }
+}
+
+/// Renders section grids, recursing into the container sections placed inside them.
+struct ContainerRenderer<'a> {
+    children: HashMap<&'a str, Vec<GridNode<'a>>>,
+    item_html: HashMap<&'a str, String>,
+    placements: &'a HashMap<String, ItemPlacement>,
+    collapsed: &'a HashMap<String, bool>,
+    /// Set for signed-in viewers: collapse toggles are then stored per user on the server.
+    collapse_board_id: Option<&'a str>,
+    open_all_label: String,
+    untitled_label: String,
+}
+
+impl<'a> ContainerRenderer<'a> {
+    fn add_child(&mut self, parent: &'a str, node: GridNode<'a>) {
+        self.children.entry(parent).or_default().push(node);
+    }
+
+    /// Orders every grid by first-layout position, so DOM order follows the visual order.
+    fn sort(&mut self) {
+        let placements = self.placements;
+        for list in self.children.values_mut() {
+            list.sort_by_key(|n| {
+                let (y, x) = placements
+                    .get(n.id())
+                    .and_then(|p| p.cells.first())
+                    .map(|c| (c.y, c.x))
+                    .unwrap_or((0, 0));
+                (y, x, n.id())
+            });
+        }
+    }
+
+    fn item_count(&self, section_id: &str) -> usize {
+        self.children.get(section_id).map_or(0, |list| {
+            list.iter()
+                .filter(|n| matches!(n, GridNode::Item(_)))
+                .count()
+        })
+    }
+
+    fn grid(&self, section_id: &str) -> String {
+        let mut html = String::new();
+        for node in self.children.get(section_id).into_iter().flatten() {
+            match node {
+                GridNode::Item(id) => {
+                    if let Some(item) = self.item_html.get(id) {
+                        html.push_str(item);
+                    }
+                }
+                GridNode::Container(sec) => html.push_str(&self.container(sec)),
+            }
+        }
+        html
+    }
+
+    /// A container section: a card placed in its parent grid with its own inner grid whose
+    /// column count is the container's width (see `.container-grid` in homarr.css).
+    fn container(&self, sec: &SectionRecord) -> String {
+        let Some(pl) = self.placements.get(&sec.id) else {
+            return String::new();
+        };
+        let opts = &sec.options;
+        let flag =
+            |key: &str, default: bool| opts.get(key).and_then(Value::as_bool).unwrap_or(default);
+        let collapsible = flag("collapsible", false);
+        let show_label = flag("showLabel", true);
+        let show_open_all = flag("showOpenAll", false);
+        let scrollable = flag("scrollable", false);
+        let title = opts
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        let label = title.unwrap_or(self.untitled_label.as_str());
+        let collapsed = collapsible && self.collapsed.get(&sec.id).copied().unwrap_or(false);
+
+        let kids = self.children.get(sec.id.as_str());
+        let mut style = cell_style(&pl.cells);
+        for (i, cell) in pl.cells.iter().enumerate() {
+            let content_rows = kids
+                .into_iter()
+                .flatten()
+                .filter_map(|n| self.placements.get(n.id())?.cells.get(i))
+                .map(|c| c.y + c.h)
+                .max()
+                .unwrap_or(0);
+            // Non-scrollable containers show all their content (rows shrink to fit the card).
+            let rows = if scrollable {
+                cell.h
+            } else {
+                cell.h.max(content_rows)
+            };
+            style.push_str(&format!("--r{i}:{rows};"));
+        }
+        if let Some(color) = advanced_str(opts, "borderColor").filter(|c| is_hex_color(c)) {
+            style.push_str(&format!("border-color:{color};border-style:solid;"));
+        }
+        let mut classes = String::new();
+        for c in safe_css_classes(opts) {
+            classes.push(' ');
+            classes.push_str(&c);
+        }
+
+        let sid = encode_attr(&sec.id);
+        let label_text = encode_text(label);
+        let label_attr = encode_attr(label);
+        let expanded = if collapsed { "false" } else { "true" };
+        let chev = icons::CHEVRON_DOWN;
+        let toggle = if collapsible && show_label {
+            format!(
+                r#"<button type="button" class="board-container-header" data-container-toggle onclick="window.toggleCategory(this)" aria-expanded="{expanded}" aria-controls="board-container-{sid}-content" title="{label_attr}"><span class="board-container-title">{label_text}</span><span class="category-chevron">{chev}</span></button>"#
+            )
+        } else if collapsible {
+            format!(
+                r#"<button type="button" class="board-container-toggle" data-container-toggle onclick="window.toggleCategory(this)" aria-expanded="{expanded}" aria-controls="board-container-{sid}-content" aria-label="{label_attr}" title="{label_attr}"><span class="category-chevron">{chev}</span></button>"#
+            )
+        } else if show_label && title.is_some() {
+            format!(
+                r#"<span class="board-container-label" title="{label_attr}">{label_text}</span>"#
+            )
+        } else {
+            String::new()
+        };
+        let open_all = if show_open_all {
+            let name = encode_attr(&self.open_all_label.replace("{name}", label)).to_string();
+            format!(
+                r#"<button type="button" class="icon-btn icon-btn-sm board-container-open-all" onclick="window.openContainerApps(this)" title="{name}" aria-label="{name}">{icon}</button>"#,
+                icon = icons::EXTERNAL_LINK,
+            )
+        } else {
+            String::new()
+        };
+        let bar = if toggle.is_empty() && open_all.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<div class="board-container-bar">{toggle}{open_all}</div>"#)
+        };
+
+        format!(
+            r#"<div class="grid-item board-section board-container{classes}" style="{style}" data-section-id="{sid}"{board_attr} data-collapsible="{collapsible}" data-collapsed="{collapsed}" data-scrollable="{scrollable}">
+  {bar}
+  <div class="board-container-body" id="board-container-{sid}-content">
+    <div class="board-grid container-grid" data-layouts>{inner}</div>
+  </div>
+</div>"#,
+            classes = encode_attr(&classes),
+            style = encode_attr(&style),
+            inner = self.grid(&sec.id),
+            board_attr = self
+                .collapse_board_id
+                .filter(|_| collapsible)
+                .map(|id| format!(r#" data-board-id="{}""#, encode_attr(id)))
+                .unwrap_or_default(),
+        )
+    }
+}
+
 async fn render_full_board(
     web: &WebState,
     session: Option<&AuthSession>,
@@ -381,8 +583,21 @@ async fn render_full_board(
         layout_style = format!(".board-grid{{--board-cols:{col_count}}}");
     }
 
-    let mut ordered_sections: Vec<_> = full.sections.iter().collect();
+    layout_style.push_str(&container_layout_css(&layouts));
+
+    // Container sections are rendered inside their parent's grid, not as stacked sections.
+    let mut ordered_sections: Vec<_> = full
+        .sections
+        .iter()
+        .filter(|s| s.kind != "container")
+        .collect();
     ordered_sections.sort_by_key(|s| (s.y_offset.unwrap_or(0), s.x_offset.unwrap_or(0)));
+    let collapsed_sections: HashMap<String, bool> = match session {
+        Some(sess) => boards::get_section_collapse_states(&state.db, &sess.user_id)
+            .await
+            .unwrap_or_default(),
+        None => HashMap::new(),
+    };
 
     let editor_strings = editor_strings(&web.i18n, &locale);
     let tr_attr = |key: &str| -> String {
@@ -394,6 +609,123 @@ async fn render_full_board(
         )
         .to_string()
     };
+
+    // Resolve all placed widgets concurrently (cached in the resolver) instead of one by one.
+    let placed_items: Vec<_> = full
+        .items
+        .iter()
+        .filter_map(|item| placements.get(&item.id).map(|pl| (item, pl)))
+        .collect();
+    let resolved = state
+        .widgets
+        .resolve_many(
+            placed_items
+                .iter()
+                .map(|(item, _)| {
+                    (
+                        WidgetKind::from_str_opt(&item.kind).unwrap_or(WidgetKind::Notebook),
+                        item.options.clone(),
+                        item.integration_ids.clone(),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+
+    let mut item_html: HashMap<&str, String> = HashMap::new();
+    for ((item, pl), result) in placed_items.into_iter().zip(resolved) {
+        let kind = WidgetKind::from_str_opt(&item.kind).unwrap_or(WidgetKind::Notebook);
+        let data = result.unwrap_or_else(|e| json!({ "error": e.to_string() }));
+
+        let mut options = item.options.clone();
+        if let (Some(title), Some(obj)) = (
+            advanced_str(&item.advanced_options, "title"),
+            options.as_object_mut(),
+        ) {
+            obj.insert("title".into(), Value::String(title.to_string()));
+        }
+        let rendered_card = render_widget_html_with_origin(
+            kind,
+            &item.id,
+            &options,
+            &data,
+            request_origin.as_deref(),
+        );
+
+        let mut extra_classes = String::new();
+        for c in safe_css_classes(&item.advanced_options) {
+            extra_classes.push(' ');
+            extra_classes.push_str(&c);
+        }
+        let mut extra_style = cell_style(&pl.cells);
+        if let Some(color) =
+            advanced_str(&item.advanced_options, "borderColor").filter(|c| is_hex_color(c))
+        {
+            extra_style.push_str(&format!("border-color:{color};border-style:solid;"));
+        }
+
+        let edit_controls = if can_edit {
+            format!(
+                r#"<div class="item-edit-overlay" data-editor-drag aria-hidden="true"></div>
+  <div class="item-edit-controls">
+<button type="button" class="icon-btn icon-btn-sm" title="{edit_t}" aria-label="{edit_t}" data-editor-action="edit-item" data-item-id="{iid}">{pencil}</button>
+<button type="button" class="icon-btn icon-btn-sm" title="{dup_t}" aria-label="{dup_t}" data-editor-action="duplicate-item" data-item-id="{iid}">{copy}</button>
+<button type="button" class="icon-btn icon-btn-sm icon-btn-danger" title="{rm_t}" aria-label="{rm_t}" data-editor-action="remove-item" data-item-id="{iid}">{trash}</button>
+  </div>
+  <div class="item-resize-handle" data-editor-resize title="Resize"></div>"#,
+                iid = encode_attr(&item.id),
+                edit_t = tr_attr("editItem"),
+                dup_t = tr_attr("duplicateItem"),
+                rm_t = tr_attr("removeItem"),
+                pencil = icons::PENCIL,
+                copy = icons::COPY,
+                trash = icons::TRASH,
+            )
+        } else {
+            String::new()
+        };
+
+        item_html.insert(
+            &item.id,
+            format!(
+                r#"<div class="grid-item{extra_classes}" style="{extra_style}" data-item-id="{iid}" data-kind="{kind_attr}">
+  {edit_controls}
+  {rendered_card}
+</div>"#,
+                extra_classes = encode_attr(&extra_classes),
+                extra_style = encode_attr(&extra_style),
+                iid = encode_attr(&item.id),
+                kind_attr = encode_attr(kind.as_str()),
+            ),
+        );
+    }
+
+    let mut grids = ContainerRenderer {
+        children: HashMap::new(),
+        item_html,
+        placements: &placements,
+        collapsed: &collapsed_sections,
+        collapse_board_id: session.map(|_| full.board.id.as_str()),
+        open_all_label: web.i18n.t(
+            &locale,
+            "section.action.openAllInNewTabsFor",
+            "Open all apps in {name} in tabs",
+        ),
+        untitled_label: web
+            .i18n
+            .t(&locale, "section.container.untitled", "Untitled container"),
+    };
+    for item in &full.items {
+        if let Some(pl) = placements.get(&item.id) {
+            grids.add_child(&pl.section_id, GridNode::Item(&item.id));
+        }
+    }
+    for sec in full.sections.iter().filter(|s| s.kind == "container") {
+        if let Some(pl) = placements.get(&sec.id) {
+            grids.add_child(&pl.section_id, GridNode::Container(sec));
+        }
+    }
+    grids.sort();
 
     let mut sections_html = String::new();
     for sec in ordered_sections {
@@ -409,91 +741,8 @@ async fn render_full_board(
                     "Main Canvas".to_string()
                 }
             });
-
-        let mut placed: Vec<(&ItemRecord, &ItemPlacement)> = full
-            .items
-            .iter()
-            .filter_map(|item| {
-                placements
-                    .get(&item.id)
-                    .filter(|p| p.section_id == sec.id)
-                    .map(|p| (item, p))
-            })
-            .collect();
-        placed.sort_by_key(|(item, p)| {
-            let (y, x) = p.cells.first().map(|c| (c.y, c.x)).unwrap_or((0, 0));
-            (y, x, item.id.clone())
-        });
-
-        let item_count = placed.len();
-        let mut grid_html = String::new();
-        for (item, pl) in placed {
-            let kind = WidgetKind::from_str_opt(&item.kind).unwrap_or(WidgetKind::Notebook);
-            let data = state
-                .widgets
-                .resolve_widget_data(kind, &item.options, &item.integration_ids)
-                .await
-                .unwrap_or_else(|e| json!({ "error": e.to_string() }));
-
-            let mut options = item.options.clone();
-            if let (Some(title), Some(obj)) = (
-                advanced_str(&item.advanced_options, "title"),
-                options.as_object_mut(),
-            ) {
-                obj.insert("title".into(), Value::String(title.to_string()));
-            }
-            let rendered_card = render_widget_html_with_origin(
-                kind,
-                &item.id,
-                &options,
-                &data,
-                request_origin.as_deref(),
-            );
-
-            let mut extra_classes = String::new();
-            for c in safe_css_classes(&item.advanced_options) {
-                extra_classes.push(' ');
-                extra_classes.push_str(&c);
-            }
-            let mut extra_style = cell_style(&pl.cells);
-            if let Some(color) =
-                advanced_str(&item.advanced_options, "borderColor").filter(|c| is_hex_color(c))
-            {
-                extra_style.push_str(&format!("border-color:{color};border-style:solid;"));
-            }
-
-            let edit_controls = if can_edit {
-                format!(
-                    r#"<div class="item-edit-overlay" data-editor-drag aria-hidden="true"></div>
-  <div class="item-edit-controls">
-    <button type="button" class="icon-btn icon-btn-sm" title="{edit_t}" aria-label="{edit_t}" data-editor-action="edit-item" data-item-id="{iid}">{pencil}</button>
-    <button type="button" class="icon-btn icon-btn-sm" title="{dup_t}" aria-label="{dup_t}" data-editor-action="duplicate-item" data-item-id="{iid}">{copy}</button>
-    <button type="button" class="icon-btn icon-btn-sm icon-btn-danger" title="{rm_t}" aria-label="{rm_t}" data-editor-action="remove-item" data-item-id="{iid}">{trash}</button>
-  </div>
-  <div class="item-resize-handle" data-editor-resize title="Resize"></div>"#,
-                    iid = encode_attr(&item.id),
-                    edit_t = tr_attr("editItem"),
-                    dup_t = tr_attr("duplicateItem"),
-                    rm_t = tr_attr("removeItem"),
-                    pencil = icons::PENCIL,
-                    copy = icons::COPY,
-                    trash = icons::TRASH,
-                )
-            } else {
-                String::new()
-            };
-
-            grid_html.push_str(&format!(
-                r#"<div class="grid-item{extra_classes}" style="{extra_style}" data-item-id="{iid}" data-kind="{kind_attr}">
-  {edit_controls}
-  {rendered_card}
-</div>"#,
-                extra_classes = encode_attr(&extra_classes),
-                extra_style = encode_attr(&extra_style),
-                iid = encode_attr(&item.id),
-                kind_attr = encode_attr(kind.as_str()),
-            ));
-        }
+        let item_count = grids.item_count(&sec.id);
+        let grid_html = grids.grid(&sec.id);
 
         let sid = encode_attr(&sec.id);
         let section_edit_bar = if can_edit {
@@ -620,7 +869,11 @@ async fn render_full_board(
         background_image_size: Some(&full.board.background_image_size),
         opacity: Some(full.board.opacity),
         item_radius: full.board.item_radius.as_deref(),
-        logo_image_url: full.board.logo_image_url.as_deref(),
+        logo_image_url: full
+            .board
+            .logo_image_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
         favicon_image_url: full.board.favicon_image_url.as_deref(),
         spotlight_items: &spotlight,
         can_edit_board: can_edit,
@@ -631,5 +884,15 @@ async fn render_full_board(
         robots_meta: None,
     };
     ui.apply(&mut ctx);
+    // Upstream shows the board's page title (falling back to the app name) next to the logo.
+    if let Some(title) = full
+        .board
+        .page_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        ctx.app_name = Some(title);
+    }
     Html(render_page(ctx))
 }

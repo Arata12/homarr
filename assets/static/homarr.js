@@ -324,30 +324,55 @@
       return {};
     }
   }
+  // Container sections are server-rendered with the signed-in user's stored state
+  // (data-board-id present, saved through the API); anonymous viewers keep it in this browser.
+  const COLLAPSIBLE_SELECTOR = ".category-section, .board-container[data-collapsible='true']";
   const collapsedMap = readCollapsedMap();
-  document.querySelectorAll(".category-section[data-section-id]").forEach((sec) => {
+  document.querySelectorAll(".category-section[data-section-id], .board-container[data-collapsible='true'][data-section-id]:not([data-board-id])").forEach((sec) => {
     const id = sec.getAttribute("data-section-id");
-    if (id && collapsedMap[id]) {
-      sec.setAttribute("data-collapsed", "true");
-      const btn = sec.querySelector(".category-header");
-      if (btn) btn.setAttribute("aria-expanded", "false");
-    }
+    if (!id || !Object.prototype.hasOwnProperty.call(collapsedMap, id)) return;
+    const collapsed = Boolean(collapsedMap[id]);
+    sec.setAttribute("data-collapsed", collapsed ? "true" : "false");
+    const btn = sec.querySelector(":scope > .category-header, :scope > .board-container-bar > [data-container-toggle]");
+    if (btn) btn.setAttribute("aria-expanded", collapsed ? "false" : "true");
   });
 
   window.toggleCategory = function (btn) {
-    const sec = btn.closest(".category-section");
+    const sec = btn.closest(COLLAPSIBLE_SELECTOR);
     if (!sec) return;
     const isCollapsed = sec.getAttribute("data-collapsed") === "true";
     const next = !isCollapsed;
     sec.setAttribute("data-collapsed", next ? "true" : "false");
     btn.setAttribute("aria-expanded", next ? "false" : "true");
     const id = sec.getAttribute("data-section-id");
-    if (id) {
+    const boardId = sec.getAttribute("data-board-id");
+    if (id && boardId) {
+      fetch(
+        "/api/boards/" + encodeURIComponent(boardId) + "/sections/" + encodeURIComponent(id) + "/collapse",
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ collapsed: next }),
+        }
+      ).catch(() => {});
+    } else if (id) {
       const map = readCollapsedMap();
-      if (next) map[id] = true;
-      else delete map[id];
-      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(map));
+      map[id] = next;
+      try {
+        localStorage.setItem(COLLAPSED_KEY, JSON.stringify(map));
+      } catch (_) {}
     }
+  };
+
+  // "Open all apps" on a container: every app tile inside it, including nested containers.
+  window.openContainerApps = function (btn) {
+    const sec = btn.closest(".board-container");
+    if (!sec) return;
+    const urls = new Set();
+    sec.querySelectorAll('.grid-item[data-kind="app"] a.app-tile[href]').forEach((a) => {
+      if (a.getAttribute("href") !== "#") urls.add(a.href);
+    });
+    urls.forEach((url) => window.open(url, "_blank", "noopener,noreferrer"));
   };
 
   // Generic declarative API form handler ([data-api-form])

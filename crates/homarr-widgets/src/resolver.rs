@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use homarr_common::{HomarrResult, SecretCrypto};
@@ -17,6 +19,7 @@ pub struct WidgetResolver {
     crypto: SecretCrypto,
     integrations: IntegrationRegistry,
     services: ServiceContainer,
+    cache: Arc<WidgetCache>,
 }
 
 impl WidgetResolver {
@@ -31,10 +34,57 @@ impl WidgetResolver {
             crypto,
             integrations,
             services,
+            cache: Arc::default(),
         }
     }
 
+    /// Resolves many widgets with bounded concurrency, preserving input order.
+    pub async fn resolve_many(
+        &self,
+        reqs: Vec<(WidgetKind, Value, Vec<String>)>,
+    ) -> Vec<HomarrResult<Value>> {
+        use futures_util::stream::{self, StreamExt};
+        stream::iter(reqs)
+            .map(|(kind, options, ids)| async move {
+                self.resolve_widget_data(kind, &options, &ids).await
+            })
+            .buffered(8)
+            .collect()
+            .await
+    }
+
+    /// Cached resolve (stale-while-revalidate) for kinds that hit external services.
     pub async fn resolve_widget_data(
+        &self,
+        kind: WidgetKind,
+        options: &Value,
+        integration_ids: &[String],
+    ) -> HomarrResult<Value> {
+        let Some(ttl) = cache_ttl(kind) else {
+            return self.resolve_uncached(kind, options, integration_ids).await;
+        };
+        let key = cache_key(kind, options, integration_ids);
+        match self.cache.lookup(&key, Instant::now()) {
+            Lookup::Hit(value) => return Ok(value),
+            Lookup::Stale(value) => {
+                let this = self.clone();
+                let options = options.clone();
+                let ids = integration_ids.to_vec();
+                tokio::spawn(async move {
+                    let result = this.resolve_uncached(kind, &options, &ids).await;
+                    this.cache.store(key, &result, ttl, Instant::now());
+                });
+                return Ok(value);
+            }
+            Lookup::Miss => {}
+        }
+        // shortcut: no single-flight, concurrent cold misses for one key all hit the integration; add a per-key lock if that shows up in load.
+        let result = self.resolve_uncached(kind, options, integration_ids).await;
+        self.cache.store(key, &result, ttl, Instant::now());
+        result
+    }
+
+    async fn resolve_uncached(
         &self,
         kind: WidgetKind,
         options: &Value,
@@ -450,6 +500,135 @@ impl WidgetResolver {
     }
 }
 
+/// Upstream request-handler default (`DEFAULT_TTL_MS`).
+const DEFAULT_TTL: Duration = Duration::from_secs(10);
+/// Error payloads are kept briefly so a down integration is not hammered, but never served stale.
+const ERROR_TTL: Duration = Duration::from_secs(5);
+/// How long expired data may still be served while a background refresh runs.
+const STALE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const MAX_ENTRIES: usize = 512;
+
+/// Per-kind TTL mirroring upstream `cacheTtlMs`; `None` = always resolve live.
+fn cache_ttl(kind: WidgetKind) -> Option<Duration> {
+    use WidgetKind as W;
+    match kind {
+        // Local/cheap kinds; App stays live so app and ping edits show immediately.
+        // BeszelAlerts: upstream beszel stats use cacheTtlMs 0 (live polling).
+        W::App
+        | W::Clock
+        | W::Bookmarks
+        | W::Countdown
+        | W::Timer
+        | W::Notebook
+        | W::Iframe
+        | W::Video
+        | W::Timetable
+        | W::Assistant
+        | W::BeszelAlerts => None,
+        W::Weather | W::MediaReleases => Some(Duration::from_secs(5 * 60)),
+        W::AirQuality => Some(Duration::from_secs(15 * 60)),
+        W::Releases => Some(Duration::from_secs(6 * 60 * 60)),
+        W::MediaRequestsRequestList | W::MediaRequestsRequestStats => Some(Duration::from_secs(60)),
+        _ => Some(DEFAULT_TTL),
+    }
+}
+
+/// Resolver output never depends on the caller (custom widgets run with a `None` user), so no user in the key.
+fn cache_key(kind: WidgetKind, options: &Value, integration_ids: &[String]) -> String {
+    format!(
+        "{}|{}|{}",
+        kind.as_str(),
+        options,
+        integration_ids.join(",")
+    )
+}
+
+fn is_error_payload(value: &Value) -> bool {
+    value.get("error").is_some() || value.get("missingIntegration").is_some()
+}
+
+struct CacheEntry {
+    value: Value,
+    fresh_until: Instant,
+    stale_until: Instant,
+    refreshing: bool,
+}
+
+enum Lookup {
+    Hit(Value),
+    /// Expired but within the stale window; the caller must refresh in the background.
+    Stale(Value),
+    Miss,
+}
+
+#[derive(Default)]
+struct WidgetCache {
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+
+impl WidgetCache {
+    fn lookup(&self, key: &str, now: Instant) -> Lookup {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = entries.get_mut(key) else {
+            return Lookup::Miss;
+        };
+        if now < entry.fresh_until {
+            Lookup::Hit(entry.value.clone())
+        } else if now < entry.stale_until {
+            if entry.refreshing {
+                Lookup::Hit(entry.value.clone())
+            } else {
+                entry.refreshing = true;
+                Lookup::Stale(entry.value.clone())
+            }
+        } else {
+            entries.remove(key);
+            Lookup::Miss
+        }
+    }
+
+    fn store(&self, key: String, result: &HomarrResult<Value>, ttl: Duration, now: Instant) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let value = match result {
+            Ok(value) => value,
+            Err(_) => {
+                // Hard errors are not cached; let the next request retry the refresh.
+                if let Some(entry) = entries.get_mut(&key) {
+                    entry.refreshing = false;
+                }
+                return;
+            }
+        };
+        let (fresh_until, stale_until) = if is_error_payload(value) {
+            let until = now + ERROR_TTL.min(ttl);
+            (until, until)
+        } else {
+            (now + ttl, now + ttl + STALE_WINDOW)
+        };
+        if entries.len() >= MAX_ENTRIES && !entries.contains_key(&key) {
+            entries.retain(|_, e| e.stale_until > now);
+            if entries.len() >= MAX_ENTRIES {
+                if let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.stale_until)
+                    .map(|(k, _)| k.clone())
+                {
+                    entries.remove(&oldest);
+                }
+            }
+        }
+        entries.insert(
+            key,
+            CacheEntry {
+                value: value.clone(),
+                fresh_until,
+                stale_until,
+                refreshing: false,
+            },
+        );
+    }
+}
+
 fn parse_host_port(raw: &str, default_port: u16) -> (String, u16) {
     let trimmed = raw.trim();
     if let Some((h, p)) = trimmed.rsplit_once(':') {
@@ -458,4 +637,55 @@ fn parse_host_port(raw: &str, default_port: u16) -> (String, u16) {
         }
     }
     (trimmed.to_string(), default_port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_keys_ttls_and_stale_while_revalidate() {
+        assert!(cache_ttl(WidgetKind::App).is_none());
+        assert!(cache_ttl(WidgetKind::Clock).is_none());
+        assert_eq!(
+            cache_ttl(WidgetKind::MediaReleases),
+            Some(Duration::from_secs(300))
+        );
+        let opts = json!({ "a": 1 });
+        let k1 = cache_key(WidgetKind::DnsHoleSummary, &opts, &["i1".to_string()]);
+        assert_ne!(
+            k1,
+            cache_key(WidgetKind::DnsHoleSummary, &opts, &["i2".to_string()])
+        );
+        assert_ne!(
+            k1,
+            cache_key(
+                WidgetKind::DnsHoleSummary,
+                &json!({ "a": 2 }),
+                &["i1".to_string()]
+            )
+        );
+
+        let cache = WidgetCache::default();
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(60);
+        cache.store(k1.clone(), &Ok(json!({ "items": [] })), ttl, t0);
+        assert!(matches!(
+            cache.lookup(&k1, t0 + Duration::from_secs(1)),
+            Lookup::Hit(_)
+        ));
+        let later = t0 + ttl + Duration::from_secs(1);
+        assert!(matches!(cache.lookup(&k1, later), Lookup::Stale(_)));
+        // Only one caller triggers the refresh; others keep getting the stale value.
+        assert!(matches!(cache.lookup(&k1, later), Lookup::Hit(_)));
+        assert!(matches!(
+            cache.lookup(&k1, t0 + ttl + STALE_WINDOW),
+            Lookup::Miss
+        ));
+
+        // Error payloads expire after ERROR_TTL with no stale window.
+        cache.store(k1.clone(), &Ok(json!({ "error": "down" })), ttl, t0);
+        assert!(matches!(cache.lookup(&k1, t0), Lookup::Hit(_)));
+        assert!(matches!(cache.lookup(&k1, t0 + ERROR_TTL), Lookup::Miss));
+    }
 }
