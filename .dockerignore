@@ -21,4 +21,3 @@ docker/Dockerfile.dev
 *.sqlite-shm
 *.log
 CHANGELOG.md
-PERFORMANCE_FINDINGS.md

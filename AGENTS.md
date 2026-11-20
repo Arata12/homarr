@@ -1,159 +1,78 @@
-# Homarr Agent Rules
+# Homarr (Rust edition) — Agent Rules
 
-## Repository Structure
+This repository is a fork of [homarr-labs/homarr](https://github.com/homarr-labs/homarr) rewritten as a pure Rust
+workspace (v3.x). The upstream TypeScript monorepo (Next.js, tRPC, Bun, Turborepo, Mantine) no longer exists here;
+ignore any upstream docs, skills or habits that assume it.
+
+## Git workflow (mandatory)
+
+- Work directly on `dev` (the default branch). Do not create feature or session branches unless the owner asks.
+- The owner works from a phone: they cannot merge, tag or delete branches by hand. Finish the whole flow yourself.
+- Commit with conventional commits (`feat:`, `fix:`, `chore:` …) and push to `dev`.
+
+## Releases
+
+1. Bump `[workspace.package] version` in the root `Cargo.toml` (crates inherit it with `version.workspace = true`)
+   and refresh the lockfile with `cargo update --workspace`. Commit as `chore(release): vX.Y.Z` on `dev`.
+2. Push a `vX.Y.Z` tag. If tag pushes are blocked, run the `Release` workflow (`release.yml`) via
+   `workflow_dispatch` with input `tag=vX.Y.Z` on `dev`: it creates the release and the tag on the `dev` head, so
+   the bump commit must already be there.
+3. The workflow builds static musl binaries (amd64, arm64), attaches them to the release and publishes
+   `ghcr.io/arata12/homarr:<version>` plus `latest` (stable releases only).
+
+Semver: `fix:`-only changes → patch; new features → minor; breaking config/data changes → major.
+
+## Repository structure
 
 ```
-homarr/
-├── apps/
-│   ├── nextjs/          # Main Next.js application (port 3000)
-│   ├── docs/            # Next.js + Fumadocs documentation site (@homarr/docs)
-│   ├── tasks/           # Cron-job initialization and scheduling runtime
-│   ├── websocket/       # Standalone tRPC WebSocket server (port 3001)
-│   └── workshop/        # Go/PocketBase Workshop service
-├── packages/
-│   ├── api/             # tRPC appRouter, procedures, OpenAPI
-│   ├── auth/            # NextAuth config, providers, session, API keys
-│   ├── db/              # SQLite and PostgreSQL schemas, migrations, queries
-│   ├── core/            # Env validation, DB/Redis driver factories, logging
-│   ├── definitions/     # Domain enums: WidgetKind, IntegrationKind, permissions
-│   ├── widgets/         # Dashboard widget definitions and components
-│   ├── integrations/    # Integration classes (HTTP clients to external apps)
-│   ├── redis/           # Redis pub/sub channels, caching abstractions
-│   ├── translation/     # next-intl setup, locale configs, lang JSON files
-│   ├── ui/              # Shared Mantine components, theme, hooks
-│   ├── validation/      # Shared zod schemas for API/forms
-│   ├── common/          # Shared utilities, IDs, errors
-│   ├── cron-jobs/       # Cron job implementations
-│   ├── cron-jobs-core/  # Cron scheduling primitives
-│   ├── cron-job-status/ # Cron status via Redis
-│   ├── boards/          # Board context, edit mode, cache updater
-│   ├── modals/          # Modal primitives on Mantine
-│   ├── modals-collection/ # Feature modals (apps, boards, docker, etc.)
-│   ├── form/            # useZodForm (Mantine + zod resolver)
-│   ├── forms-collection/# Reusable form UIs (new app, icon picker, upload)
-│   ├── spotlight/       # Command palette / search with multiple modes
-│   ├── request-handler/ # Server request handlers (feeds, integrations)
-│   ├── notifications/   # Mantine notifications wrapper
-│   ├── docker/          # Dockerode-based Docker access
-│   ├── icons/           # Icon DB/repo integration
-│   ├── image-proxy/     # Image proxy + caching
-│   ├── ping/            # Reachability / ping utilities
-│   ├── analytics/       # Server-side analytics (Umami)
-│   ├── server-settings/ # Server setting keys/types
-│   ├── settings/        # User-facing settings UI context
-│   ├── custom-widgets/  # Custom JSX v2 schema, validation, and runtime
-│   ├── onboarding/      # Onboarding studio and setup flow
-│   ├── workshop/        # Homarr-side Workshop client and contracts
-│   └── cli/             # Node CLI for ops (brocli)
-├── tooling/
-│   ├── typescript/      # Base tsconfig
-│   └── github/          # CI setup action
-├── tools/
-│   └── homarr-dev/      # Go CLI for local and PR Docker images
-├── development/         # Dev docker-compose (Redis, MySQL, PostgreSQL)
-├── e2e/                 # E2E test specs
-└── Dockerfile           # Multi-stage production build
+crates/
+├── homarr-server/        # Main binary: axum server wiring API, web UI, static assets, background tasks
+├── homarr-cli/           # `homarr` ops CLI binary
+├── homarr-workshop/      # Workshop service binary
+├── homarr-api/           # JSON API routes, OpenAPI, MCP endpoint, WebSocket, CSRF, AppState
+├── homarr-web/           # Server-rendered HTML pages (board, editor, manage, auth) + i18n
+├── homarr-auth/          # Sessions, passwords, API keys, permission checks, axum extractors
+├── homarr-db/            # sqlx pool (SQLite/PostgreSQL), models, repositories, seed, backup
+├── homarr-core/          # Env config (AppConfig), logging, HTTP client factory, trusted certificates
+├── homarr-common/        # Shared errors, IDs, encryption, URL helpers, grid algorithm, superjson
+├── homarr-definitions/   # Domain enums/metadata: IntegrationKind, WidgetKind, permissions, settings
+├── homarr-integrations/  # Integration clients grouped by domain (media, downloads_network, home_misc, stats, mock)
+├── homarr-services/      # Docker, Kubernetes, icons, image proxy, ping, custom widgets, assistant
+├── homarr-widgets/       # Widget registry, option schemas/sanitizing, rendering
+├── homarr-tasks/         # Background/cron jobs
+└── homarr-redis/         # Redis store (with in-memory fallback when REDIS_DISABLED)
+assets/                   # locales/*.json, static/ (homarr.js, board-editor.js, homarr.css), public/
+migrations/{sqlite,postgres}/  # sqlx migrations, embedded at compile time (see migrations/README.md)
+docker/                   # Dockerfile.dev / .release / .workshop, entrypoint
+.github/workflows/        # ci.yml (fmt, clippy, tests), release.yml (binaries + GHCR images)
 ```
 
-## Integration contributions
+## Commands
 
-For a new integration, reuse Statistics or another existing widget when it covers the use case. For a service-specific
-view, prefer publishing a Custom Widget that uses the saved integration. Link its Workshop listing from the integration
-PR and setup guide when available. Add a built-in widget only when the use case cannot be served by existing widgets or
-Custom Widgets; explain the gap in the PR. See [the Yuvomi PR](https://github.com/homarr-labs/homarr/pull/7493#issuecomment-6699406618)
-for an example.
+- `cargo fmt --all` — format (CI runs `cargo fmt --all -- --check`)
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — lint; warnings fail CI
+- `cargo test --workspace --locked` — tests
+- `cargo run -p homarr-server` — run the app locally (port 7575 by default; config via env, see `.env.example`)
+- `docker compose --profile dev up` — dev container plus Redis
 
-## Documentation
+## Code rules
 
-Add documentation only when users need the information to set up, use, or troubleshoot Homarr and cannot reasonably discover it from the UI or generated API schema. If a user does not need to know it, do not document it. A code, UI, or API change alone is never a reason to add docs.
+- Keep logic in the deepest crate that owns it; search `homarr-common` before adding a helper.
+- New integration: add the kind and metadata in `homarr-definitions`, the client in the matching
+  `homarr-integrations/src/groups/<domain>/` module, wire it into that group's `mod.rs` dispatch, and declare its
+  auth in `http_auth.rs`. Reuse an existing widget when it covers the use case.
+- New widget: add the `WidgetKind` in `homarr-definitions` and its metadata/options in `homarr-widgets`.
+- Schema change: add a new numbered migration in BOTH `migrations/sqlite` and `migrations/postgres`. Never edit an
+  applied migration.
+- HTML in `homarr-web` is built from strings: every interpolated value must go through `html_escape`
+  (`encode_text` / `encode_double_quoted_attribute`). Never insert user or integration data unescaped.
+- Outbound HTTP must use `HttpClientFactory` from `homarr-core` (trusted certificates; `guarded()` /
+  `guarded_get` block private-network SSRF targets for user-supplied URLs). Do not build ad-hoc `reqwest` clients.
+- Secrets (integration credentials) are stored encrypted via `homarr-common` encryption; never log or return them.
 
-Keep warranted documentation concise. Omit UI walkthroughs, visible control descriptions, internal implementation details, and anything already clear from the interface or schema.
+## Tests and docs
 
-Only after this user-need test passes, use these locations:
-
-- New integration → `apps/docs/docs/integrations/<slug>/index.mdx` + `index.ts`
-- New widget → `apps/docs/docs/widgets/<slug>/index.mdx` + `index.ts`
-- Changed API → `apps/docs/docs/management/api/index.mdx`
-- New/changed env vars → `apps/docs/docs/advanced/`
-- New CLI commands → `apps/docs/docs/advanced/command-line/`
-- Auth changes → `apps/docs/docs/advanced/` SSO pages
-- New cron job → `apps/docs/docs/management/tasks.mdx`
-
-## Monorepo Commands
-
-- `bun run dev` — Next.js app only
-- `bun run dev:cli -- dev` — run the developer CLI without installing a global binary
-- `bun run db:seed` — seed default database data explicitly
-- `bun run docker:dev:up` — start the Redis development service in the background
-- `bun run dev:docs` — Fumadocs site only
-- `bun run turbo build` — build all packages
-- `bun run turbo build --filter=@homarr/docs` — build docs only
-- `bun run turbo typecheck` — typecheck all packages
-- `bun run lint` / `bun run format` — oxlint / oxfmt
-
-## Code Style
-
-- Lint: oxlint (not ESLint)
-- Format: oxfmt (not Prettier)
-- UI: Mantine (not Tailwind) — Tailwind is only used in docs app
-- Mantine: before creating, changing, or reviewing application UI, follow [mantine-ui](plugins/homarr-mantine/skills/mantine-ui/SKILL.md) for component discovery, mandatory `get_item_doc` lookups, and styling through built-in props and the Styles API.
-- Icons: @tabler/icons-react
-- Docs app can import from `@homarr/definitions` for shared types
-- Run `bun run dev:cli -- dev` to browse local `homarr:*` images and remote PR images.
-- Run `bun run dev:cli -- build <name>` from a Homarr checkout to build `homarr:<name>` with rebuild provenance.
-- Run `bun run dev:cli -- build --pr <number>` to build a PR locally from a temporary checkout.
-
-## Testing
-
-Add tests only when requested, and only when the test is extremely relevant and will plausibly prevent a future regression in user-visible behavior or a security boundary. Do not add tests that restate implementation details or duplicate stronger coverage. For focused changes, run only the relevant existing or newly requested checks when validation is needed. Do not run broad test, Docker, or E2E suites by default.
-
-## AI-assisted pull requests
-
-These rules apply to every PR an agent prepares or opens, including contributor PRs. A PR that does not meet them will be closed.
-
-- Prove the change in the running app. Start Homarr locally, reproduce the reported case on unmodified `dev`, then repeat it on the PR head using `agent-browser` (`agent-browser skills get core` loads its workflow). Use the same viewport, theme, fixture data and settings for both captures.
-- The PR body must open with a before/after table of those screenshots, uploaded with `gh pr create --attach` (or `gh pr comment --attach`). Local paths, mock-ups and test-runner output are not substitutes. Read back the published body and check the images render.
-- For behavior that only shows over time (polling, refresh, notifications), capture the same view at the relevant moments, or a short recording, in the same table.
-- Changes with no user-visible effect (types, internal refactors, CI) state that in one line instead of the table.
-- Keep the body short: the problem, the resulting behavior, the evidence table, and one or two lines of relevant validation. No validation logs, environment recitals, private replay descriptions or checklists of what was not tested.
-- Contributors must not use the `homarr-triage` skill or its `> _This was generated by AI during triage._` disclaimer; disclose AI assistance in plain words instead. PRs a maintainer explicitly runs through `homarr-triage` keep that disclaimer as their first line.
-
-## MCP servers
-
-The [Homarr Mantine plugin](plugins/homarr-mantine/plugin.json) bundles the UI skill and pinned documentation MCP server. `.agents/plugins/marketplace.json` exposes it through the project marketplace, and `.codex/config.toml` enables it for this repository. For clients requiring registration, run `codex plugin marketplace add .` from the repository root, then `codex plugin add homarr-mantine@homarr-local`. Keep shared definitions keyless; credentials belong in local dotfiles. See [Mantine LLM tooling](https://mantine.dev/guides/llms/) for documentation sources.
-
-## Agent Skills
-
-Portable skills live in `.agents/skills/`. Read the relevant `SKILL.md` before working in that domain; detailed references are loaded only when needed. Claude-compatible discovery is provided through `.claude/skills`.
-
-- `codebase-context` — architecture, package boundaries, and shared utilities
-- `homarr-mantine:mantine-ui` — project plugin for Mantine component discovery, documentation, and built-in styling
-- `documentation-sync` — user-critical documentation only
-- `mcp-integration` — safe tRPC-to-MCP exposure
-- `homarr-custom-widget` — safe Custom JSX v2 authoring
-- `homarr-triage` — maintainer-only, explicit invocation; issue/PR queues, reporter follow-ups, and GitHub Project operations
-
-### Issue tracker
-
-Use GitHub Issues and pull requests in `homarr-labs/homarr` for agent work.
-Read `docs/agents/issue-tracker.md` before reading or updating reports.
-
-### Triage labels
-
-Use the exact GitHub label mappings, size weights and reporter testing states in
-`docs/agents/triage-labels.md` when triaging issues or PRs.
-
-### Domain docs
-
-Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
-
-<!-- BEGIN:turborepo-agent-rules -->
-
-# This is NOT the Turborepo you know
-
-Turborepo configuration, task behavior, and CLI commands can vary between installed versions and may differ from your training data. Resolve the `turbo` package from this file's directory or relevant workspace; in monorepos, it may not be visible from the repository root. For example, run `node -p "require.resolve('turbo/package.json')"` from a workspace that depends on `turbo`.
-
-Read `docs/README.md` inside that installed package first, then read the relevant pages from its `docs/` directory before changing Turborepo configuration or commands. Heed deprecation notices. These bundled docs match the installed package version and are available without network access.
-
-This block is written and re-added by `turbo` before repository-scoped commands when an AI agent is detected. In the Turborepo source repository, its template is defined in `crates/turborepo-cli/src/cli/agent_guidance.rs`. Removing the managed block while updates are enabled means a later qualifying invocation will add it again. Set `"agentGuidance": false` in the root `turbo.json` or `turbo.jsonc` to opt out; this does not remove an existing block. When agent guidance is enabled, keep the block committed to avoid an uncommitted change on the next agent invocation. This repository disables agent guidance in `turbo.json`.
-<!-- END:turborepo-agent-rules -->
+- Add tests only when they plausibly prevent a regression in user-visible behavior or a security boundary.
+- For focused changes run the affected crate (`cargo test -p <crate>`); run the full CI trio before releasing.
+- Document only what users need to install, configure or troubleshoot (README, `.env.example`). A code change alone
+  is not a reason to add docs.

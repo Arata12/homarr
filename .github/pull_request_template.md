@@ -7,13 +7,12 @@
 **Thank you for your contribution. Please ensure that your pull request meets the following requirements:**
 
 - [ ] Relevant checks pass without warnings or errors
-- [ ] Pull request targets the intended base branch (`dev` by default; `release/v2` for v2 release work)
+- [ ] Pull request targets the intended base branch (`dev`)
 - [ ] Commits follow the [conventional commits guideline](https://www.conventionalcommits.org/en/v1.0.0/)
 - [ ] No shorthand variable names are used (for example, `x`, `y`, `i`, or abbreviations)
-- [ ] Documentation under `apps/docs` is updated only when users need new or corrected information to use the app
+- [ ] `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test` pass
+- [ ] Docs (README, `.env.example`) are updated only when users need new or corrected information to use the app
 - [ ] When using AI, no temporary files are checked in and the code style follows the rest of the project
-- [ ] When using AI, the PR follows "AI-assisted pull requests" in `AGENTS.md`, including a before/after screenshot table
-      for user-visible changes
 
 **When contributing a new integration or widget:**
 
