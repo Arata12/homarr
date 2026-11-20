@@ -4,6 +4,17 @@ Release notes for each version, with binaries and Docker images, are on the
 [GitHub releases page](https://github.com/Arata12/homarr/releases). For upstream Homarr
 history (v2.x and earlier), see [homarr-labs/homarr](https://github.com/homarr-labs/homarr/releases).
 
+## v3.0.2
+
+### Fixed
+
+- Boards load much faster: widget data is cached with upstream TTLs and resolved concurrently (#6).
+- Container sections (categories) render nested with their title, collapse state per user and "open all" (#6).
+- App status dot falls back to the app link when no ping URL is set (#6).
+- Uploaded icons from upstream data load again via `/api/user-medias/{id}` (#6).
+- The header shows the board's page title and logo (#6).
+- Closed remaining gaps versus upstream: Docker endpoint TLS, session expiry, board access, validation and image proxy (#5).
+
 ## v3.0.1
 
 ### Fixed
