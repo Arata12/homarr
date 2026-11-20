@@ -650,7 +650,7 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   {robots_tag}
-  <title>{title} — {brand_name}</title>
+  <title>{doc_title}</title>
   <link rel="icon" href="{favicon}" />
   <link rel="stylesheet" href="/static/homarr.css" />
   {custom_style}
@@ -694,7 +694,11 @@ pub fn render_page(ctx: PageContext<'_>) -> String {
 </body>
 </html>"#,
         lang = encode_attr(ctx.locale),
-        title = encode_text(ctx.title),
+        doc_title = if ctx.title.trim() == brand_name {
+            brand_name.to_string()
+        } else {
+            format!("{} — {brand_name}", encode_text(ctx.title))
+        },
         favicon = encode_attr(&favicon_href),
         body = ctx.body,
         editor_script_tag = if ctx.can_edit_board {

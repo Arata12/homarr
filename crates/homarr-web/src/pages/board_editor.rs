@@ -1,11 +1,11 @@
 //! Server-side helpers for the visual board editor: responsive placements, the editor data
 //! blob consumed by `assets/static/board-editor.js`, and the edit-mode chrome.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use homarr_auth::{check_integration_permission, AuthSession};
 use homarr_db::{
-    models::{FullBoard, ItemRecord, LayoutRecord},
+    models::{FullBoard, ItemRecord, LayoutRecord, SectionRecord},
     repos::{apps, integrations},
     Database,
 };
@@ -78,93 +78,215 @@ pub fn first_free(occupied: &[(i32, i32, i32, i32)], cols: i32, w: i32, h: i32) 
     (0, 0)
 }
 
-/// Computes, for every item, its section and its cell in each layout. Missing placements are
-/// reflowed around the stored ones so every layout renders every item.
+/// A stored placement of an item or container in one layout.
+#[derive(Debug, Clone, Copy)]
+pub struct StoredCell<'a> {
+    pub layout_id: &'a str,
+    pub parent_id: &'a str,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// Something placed on a section grid: a widget item or a nested container section.
+#[derive(Debug, Clone)]
+pub struct GridChild<'a> {
+    pub id: &'a str,
+    pub is_container: bool,
+    pub stored: Vec<StoredCell<'a>>,
+}
+
+fn base_cell<'c, 'a>(c: &'c GridChild<'a>, base_id: Option<&str>) -> Option<&'c StoredCell<'a>> {
+    c.stored
+        .iter()
+        .find(|s| Some(s.layout_id) == base_id)
+        .or_else(|| c.stored.first())
+}
+
+/// Computes, for every item and every container section, its parent section and its cell in
+/// each layout. Containers are placed inside their parent; their own children are then placed
+/// in a grid whose column count is the container's width in that layout (as upstream does).
+/// Missing placements are reflowed around the stored ones so every layout renders everything.
 pub fn compute_placements(
     full: &FullBoard,
     layouts: &[&LayoutRecord],
 ) -> HashMap<String, ItemPlacement> {
+    let mut roots: Vec<&SectionRecord> = full
+        .sections
+        .iter()
+        .filter(|s| s.kind != "container")
+        .collect();
+    roots.sort_by_key(|s| (s.y_offset.unwrap_or(0), s.x_offset.unwrap_or(0)));
+    let root_ids: Vec<&str> = roots.iter().map(|s| s.id.as_str()).collect();
+
     let base_id = base_layout_id(full);
-    let fallback_section = full.sections.first().map(|s| s.id.as_str());
-    let mut by_section: HashMap<&str, Vec<&ItemRecord>> = HashMap::new();
-    for item in &full.items {
-        if let Some(sec) = item_section(item, base_id).or(fallback_section) {
-            by_section.entry(sec).or_default().push(item);
+    let mut children: Vec<GridChild> = full
+        .items
+        .iter()
+        .map(|item| GridChild {
+            id: &item.id,
+            is_container: false,
+            stored: item
+                .layouts
+                .iter()
+                .map(|l| StoredCell {
+                    layout_id: &l.layout_id,
+                    parent_id: &l.section_id,
+                    x: l.x_offset,
+                    y: l.y_offset,
+                    w: l.width,
+                    h: l.height,
+                })
+                .collect(),
+        })
+        .collect();
+    children.extend(
+        full.sections
+            .iter()
+            .filter(|s| s.kind == "container")
+            .map(|s| GridChild {
+                id: &s.id,
+                is_container: true,
+                stored: s
+                    .layouts
+                    .iter()
+                    .filter_map(|l| {
+                        Some(StoredCell {
+                            layout_id: &l.layout_id,
+                            parent_id: l.parent_section_id.as_deref()?,
+                            x: l.x_offset,
+                            y: l.y_offset,
+                            w: l.width,
+                            h: l.height,
+                        })
+                    })
+                    .collect(),
+            }),
+    );
+    place_tree(&root_ids, &children, layouts, base_id)
+}
+
+/// Placement core of [`compute_placements`], free of database records so it can be tested.
+pub fn place_tree(
+    root_ids: &[&str],
+    children: &[GridChild<'_>],
+    layouts: &[&LayoutRecord],
+    base_id: Option<&str>,
+) -> HashMap<String, ItemPlacement> {
+    let mut out: HashMap<String, ItemPlacement> = HashMap::new();
+    let Some(&fallback) = root_ids.first() else {
+        return out;
+    };
+    let containers: HashSet<&str> = children
+        .iter()
+        .filter(|c| c.is_container)
+        .map(|c| c.id)
+        .collect();
+    let mut parent: HashMap<&str, &str> = children
+        .iter()
+        .map(|c| {
+            let p = base_cell(c, base_id)
+                .map(|s| s.parent_id)
+                .filter(|p| *p != c.id && (root_ids.contains(p) || containers.contains(p)))
+                .unwrap_or(fallback);
+            (c.id, p)
+        })
+        .collect();
+    // A container nested (indirectly) inside itself would never render: move it to the root.
+    for c in children.iter().filter(|c| c.is_container) {
+        let mut cur = parent[c.id];
+        let mut steps = 0;
+        while cur != c.id && containers.contains(cur) && steps <= containers.len() {
+            cur = parent[cur];
+            steps += 1;
+        }
+        if cur == c.id {
+            parent.insert(c.id, fallback);
         }
     }
 
-    let mut out: HashMap<String, ItemPlacement> = HashMap::new();
-    for (section_id, mut items) in by_section {
-        let base_pos = |i: &ItemRecord| {
-            i.layouts
+    let mut by_parent: HashMap<&str, Vec<&GridChild>> = HashMap::new();
+    for c in children {
+        by_parent.entry(parent[c.id]).or_default().push(c);
+    }
+
+    let root_cols: Vec<i32> = layouts.iter().map(|l| l.column_count.max(1)).collect();
+    let mut queue: Vec<(&str, Vec<i32>)> =
+        root_ids.iter().map(|r| (*r, root_cols.clone())).collect();
+    while let Some((section_id, cols_per_layout)) = queue.pop() {
+        let Some(mut list) = by_parent.remove(section_id) else {
+            continue;
+        };
+        let base_pos = |c: &GridChild| {
+            c.stored
                 .iter()
-                .find(|l| l.section_id == section_id && Some(l.layout_id.as_str()) == base_id)
-                .map(|l| (l.y_offset, l.x_offset))
+                .find(|s| s.parent_id == section_id && Some(s.layout_id) == base_id)
+                .map(|s| (s.y, s.x))
                 .unwrap_or((i32::MAX, 0))
         };
-        items.sort_by(|a, b| base_pos(a).cmp(&base_pos(b)).then_with(|| a.id.cmp(&b.id)));
-        let base_size = |i: &ItemRecord| {
-            i.layouts
-                .iter()
-                .find(|l| Some(l.layout_id.as_str()) == base_id)
-                .or_else(|| i.layouts.first())
-                .map(|l| (l.width, l.height))
-                .unwrap_or((2, 1))
-        };
+        list.sort_by(|&a, &b| base_pos(a).cmp(&base_pos(b)).then_with(|| a.id.cmp(b.id)));
 
-        let mut cells: HashMap<&str, Vec<Cell>> = HashMap::new();
-        for layout in layouts {
-            let cols = layout.column_count.max(1);
-            let mut occupied: Vec<(i32, i32, i32, i32)> = Vec::new();
-            let mut staged: Vec<Option<Cell>> = Vec::new();
-            for item in &items {
-                let real = item
-                    .layouts
-                    .iter()
-                    .find(|l| l.layout_id == layout.id && l.section_id == section_id);
-                staged.push(real.map(|l| {
-                    let w = l.width.clamp(1, cols);
-                    Cell {
-                        x: l.x_offset.clamp(0, cols - w),
-                        y: l.y_offset.max(0),
-                        w,
-                        h: l.height.clamp(1, MAX_ITEM_HEIGHT),
-                        real: true,
-                    }
-                }));
-                if let Some(Some(c)) = staged.last() {
-                    occupied.push((c.x, c.y, c.w, c.h));
-                }
+        let max_h = |c: &GridChild| {
+            if c.is_container {
+                i32::MAX
+            } else {
+                MAX_ITEM_HEIGHT
             }
-            for (item, slot) in items.iter().zip(staged.iter_mut()) {
-                if slot.is_none() {
-                    let (bw, bh) = base_size(item);
+        };
+        let mut cells: Vec<Vec<Cell>> = vec![Vec::with_capacity(layouts.len()); list.len()];
+        for (layout, &cols) in layouts.iter().zip(&cols_per_layout) {
+            let cols = cols.max(1);
+            let staged: Vec<Option<Cell>> = list
+                .iter()
+                .map(|&c| {
+                    c.stored
+                        .iter()
+                        .find(|s| s.layout_id == layout.id && s.parent_id == section_id)
+                        .map(|s| {
+                            let w = s.w.clamp(1, cols);
+                            Cell {
+                                x: s.x.clamp(0, cols - w),
+                                y: s.y.max(0),
+                                w,
+                                h: s.h.clamp(1, max_h(c)),
+                                real: true,
+                            }
+                        })
+                })
+                .collect();
+            let mut occupied: Vec<(i32, i32, i32, i32)> = staged
+                .iter()
+                .flatten()
+                .map(|c| (c.x, c.y, c.w, c.h))
+                .collect();
+            for (i, (&c, slot)) in list.iter().zip(staged).enumerate() {
+                let cell = slot.unwrap_or_else(|| {
+                    let (bw, bh) = base_cell(c, base_id).map(|s| (s.w, s.h)).unwrap_or((2, 1));
                     let w = bw.clamp(1, cols);
-                    let h = bh.clamp(1, MAX_ITEM_HEIGHT);
+                    let h = bh.clamp(1, max_h(c));
                     let (x, y) = first_free(&occupied, cols, w, h);
                     occupied.push((x, y, w, h));
-                    *slot = Some(Cell {
+                    Cell {
                         x,
                         y,
                         w,
                         h,
                         real: false,
-                    });
-                }
-            }
-            for (item, slot) in items.iter().zip(staged) {
-                cells
-                    .entry(item.id.as_str())
-                    .or_default()
-                    .push(slot.expect("placement staged"));
+                    }
+                });
+                cells[i].push(cell);
             }
         }
-        for item in &items {
+        for (c, cells) in list.into_iter().zip(cells) {
+            if c.is_container {
+                queue.push((c.id, cells.iter().map(|cell| cell.w).collect()));
+            }
             out.insert(
-                item.id.clone(),
+                c.id.to_string(),
                 ItemPlacement {
                     section_id: section_id.to_string(),
-                    cells: cells.remove(item.id.as_str()).unwrap_or_default(),
+                    cells,
                 },
             );
         }
@@ -558,4 +680,82 @@ pub fn edit_bar_html(board_name: &str, strings: &Value) -> String {
         gear = icons::SETTINGS,
         check = icons::CHECK,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(id: &str, cols: i32) -> LayoutRecord {
+        LayoutRecord {
+            id: id.into(),
+            name: id.into(),
+            board_id: "b".into(),
+            column_count: cols,
+            left_gutter_column_count: 0,
+            right_gutter_column_count: 0,
+            breakpoint: 0,
+            role: id.into(),
+            resize_source: None,
+        }
+    }
+
+    fn child<'a>(
+        id: &'a str,
+        is_container: bool,
+        stored: &[(&'a str, i32, i32, i32, i32)],
+    ) -> GridChild<'a> {
+        GridChild {
+            id,
+            is_container,
+            stored: stored
+                .iter()
+                .map(|&(parent_id, x, y, w, h)| StoredCell {
+                    layout_id: "base",
+                    parent_id,
+                    x,
+                    y,
+                    w,
+                    h,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn nests_containers_and_uses_container_width_as_columns() {
+        let base = layout("base", 12);
+        let mobile = layout("mobile", 2);
+        let layouts = [&mobile, &base];
+        let children = vec![
+            child("c1", true, &[("root", 2, 0, 4, 3)]),
+            child("c2", true, &[("c1", 0, 0, 3, 2)]),
+            child("a", false, &[("c2", 1, 0, 5, 1)]),
+            child("r", false, &[("root", 0, 0, 2, 1)]),
+            child("n", false, &[]),
+            // Cycle: neither may vanish.
+            child("x", true, &[("y", 0, 0, 1, 1)]),
+            child("y", true, &[("x", 0, 0, 1, 1)]),
+        ];
+        let out = place_tree(&["root"], &children, &layouts, Some("base"));
+        let cell = |id: &str, li: usize| {
+            let c = out[id].cells[li];
+            (c.x, c.y, c.w, c.h)
+        };
+
+        assert_eq!(out["c1"].section_id, "root");
+        assert_eq!(out["c2"].section_id, "c1");
+        assert_eq!(out["a"].section_id, "c2");
+        assert_eq!(cell("c1", 1), (2, 0, 4, 3));
+        assert_eq!(cell("c2", 1), (0, 0, 3, 2));
+        // Inside c2 the grid has 3 columns, so the 5-wide item is clamped.
+        assert_eq!(cell("a", 1), (0, 0, 3, 1));
+        // Reflowed root items avoid the container's cells.
+        assert_eq!(cell("n", 1), (6, 0, 2, 1));
+        // Mobile has no stored rows: everything reflows within its parent's width.
+        assert_eq!(cell("c1", 0).2, 2);
+        assert_eq!(cell("a", 0).2, 2);
+        assert!(!out["a"].cells[0].real && out["a"].cells[1].real);
+        assert!(out.contains_key("x") && out.contains_key("y"));
+    }
 }

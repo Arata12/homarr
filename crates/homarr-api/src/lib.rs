@@ -65,6 +65,10 @@ pub fn api_router(state: AppState) -> Router {
             delete(boards::delete_board_section),
         )
         .route(
+            "/api/boards/{id}/sections/{section_id}/collapse",
+            put(boards::set_section_collapsed),
+        )
+        .route(
             "/api/boards/{id}/permissions",
             get(boards::get_board_permissions).put(boards::set_board_permissions),
         )
@@ -177,6 +181,8 @@ pub fn api_router(state: AppState) -> Router {
             "/api/medias/{id}",
             get(search_icons_media::get_media).delete(search_icons_media::delete_media),
         )
+        // Upstream Homarr stores uploaded media URLs as /api/user-medias/{id}.
+        .route("/api/user-medias/{id}", get(search_icons_media::get_media))
         .route(
             "/api/image-proxy/forward",
             post(search_icons_media::image_proxy_forward),
@@ -1281,5 +1287,71 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["user"]["enableGravatar"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn section_collapse_is_per_user_and_requires_auth() {
+        let (state, app) = setup_test_state().await;
+        let admin = login_cookie(&app, "demo", "demo").await;
+        let board = repos::boards::create_board_with_defaults(
+            &state.db,
+            repos::boards::CreateBoardInput {
+                id: None,
+                name: "collapse-board".into(),
+                is_public: false,
+                creator_id: None,
+                column_count: 10,
+            },
+        )
+        .await
+        .unwrap();
+        let board_id = board.board.id.clone();
+        let mut sections: Vec<repos::boards::SaveBoardSectionInput> = board
+            .sections
+            .iter()
+            .map(|s| repos::boards::SaveBoardSectionInput {
+                id: s.id.clone(),
+                kind: s.kind.clone(),
+                x_offset: s.x_offset,
+                y_offset: s.y_offset,
+                name: s.name.clone(),
+                options: s.options.clone(),
+                layouts: s.layouts.clone(),
+            })
+            .collect();
+        sections.push(repos::boards::SaveBoardSectionInput {
+            id: "container-1".into(),
+            kind: "container".into(),
+            x_offset: None,
+            y_offset: None,
+            name: None,
+            options: json!({ "title": "Media", "collapsible": true }),
+            layouts: Vec::new(),
+        });
+        repos::boards::save_board_content(&state.db, &board_id, &sections, &[])
+            .await
+            .unwrap();
+        let uri = format!("/api/boards/{board_id}/sections/container-1/collapse");
+
+        let (status, _) = send_json(&app, "PUT", &uri, None, json!({ "collapsed": true })).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = send_json(
+            &app,
+            "PUT",
+            &uri,
+            Some(&admin),
+            json!({ "collapsed": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let demo = repos::users::find_by_name_ci(&state.db, "demo")
+            .await
+            .unwrap()
+            .unwrap();
+        let states = repos::boards::get_section_collapse_states(&state.db, &demo.id)
+            .await
+            .unwrap();
+        assert_eq!(states.get("container-1"), Some(&true));
     }
 }

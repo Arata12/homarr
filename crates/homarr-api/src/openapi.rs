@@ -89,6 +89,10 @@ pub async fn openapi_spec() -> Json<Value> {
             json!({ "delete": { "summary": "Delete board section" } }),
         ),
         (
+            "/api/boards/{id}/sections/{section_id}/collapse",
+            json!({ "put": { "summary": "Set your collapsed state of a container section" } }),
+        ),
+        (
             "/api/boards/{id}/permissions",
             json!({ "get": { "summary": "Get board permissions" }, "put": { "summary": "Set board permissions" } }),
         ),
