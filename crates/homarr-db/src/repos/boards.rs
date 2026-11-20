@@ -873,347 +873,15 @@ pub async fn save_board_content(
     if get_by_id(db, board_id).await?.is_none() {
         return Err(HomarrError::NotFound(format!("Board {board_id} not found")));
     }
-
-    let new_section_ids: std::collections::HashSet<&str> =
-        sections.iter().map(|s| s.id.as_str()).collect();
-    let new_item_ids: std::collections::HashSet<&str> =
-        items.iter().map(|i| i.id.as_str()).collect();
-
     match db {
         Database::Sqlite(pool) => {
             let mut tx = pool.begin().await.map_err(map_sqlx_err)?;
-
-            let old_item_ids: Vec<String> =
-                sqlx::query_scalar(r#"SELECT "id" FROM "item" WHERE "board_id" = ?"#)
-                    .bind(board_id)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-            let old_section_ids: Vec<String> =
-                sqlx::query_scalar(r#"SELECT "id" FROM "section" WHERE "board_id" = ?"#)
-                    .bind(board_id)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-
-            sqlx::query(
-                r#"DELETE FROM "item_layout" WHERE "item_id" IN (SELECT "id" FROM "item" WHERE "board_id" = ?)"#,
-            )
-            .bind(board_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
-            sqlx::query(
-                r#"DELETE FROM "integration_item" WHERE "item_id" IN (SELECT "id" FROM "item" WHERE "board_id" = ?)"#,
-            )
-            .bind(board_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
-            sqlx::query(
-                r#"DELETE FROM "section_layout" WHERE "section_id" IN (SELECT "id" FROM "section" WHERE "board_id" = ?)"#,
-            )
-            .bind(board_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
-
-            // Delete only items and sections actually removed so kept rows preserve
-            // `widget_secret`, `user_item_state`, and `section_collapse_state`.
-            for old_id in &old_item_ids {
-                if !new_item_ids.contains(old_id.as_str()) {
-                    sqlx::query(r#"DELETE FROM "item" WHERE "id" = ? AND "board_id" = ?"#)
-                        .bind(old_id)
-                        .bind(board_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(map_sqlx_err)?;
-                }
-            }
-            for old_id in &old_section_ids {
-                if !new_section_ids.contains(old_id.as_str()) {
-                    sqlx::query(r#"DELETE FROM "section" WHERE "id" = ? AND "board_id" = ?"#)
-                        .bind(old_id)
-                        .bind(board_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(map_sqlx_err)?;
-                }
-            }
-
-            for s in sections {
-                let opts = serialize_superjson(&s.options)?;
-                let res = sqlx::query(
-                    r#"INSERT INTO "section" ("id", "board_id", "kind", "x_offset", "y_offset", "name", "options")
-                       VALUES (?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT ("id") DO UPDATE SET
-                         "kind" = excluded."kind",
-                         "x_offset" = excluded."x_offset",
-                         "y_offset" = excluded."y_offset",
-                         "name" = excluded."name",
-                         "options" = excluded."options"
-                       WHERE "section"."board_id" = excluded."board_id""#,
-                )
-                .bind(&s.id)
-                .bind(board_id)
-                .bind(&s.kind)
-                .bind(s.x_offset)
-                .bind(s.y_offset)
-                .bind(&s.name)
-                .bind(&opts)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_err)?;
-                if res.rows_affected() != 1 {
-                    return Err(HomarrError::Conflict(format!(
-                        "Section '{}' belongs to a different board",
-                        s.id
-                    )));
-                }
-            }
-
-            for s in sections {
-                for l in &s.layouts {
-                    sqlx::query(
-                        r#"INSERT INTO "section_layout" ("section_id", "layout_id", "parent_section_id", "x_offset", "y_offset", "width", "height")
-                           VALUES (?, ?, ?, ?, ?, ?, ?)"#,
-                    )
-                    .bind(&s.id)
-                    .bind(&l.layout_id)
-                    .bind(&l.parent_section_id)
-                    .bind(l.x_offset)
-                    .bind(l.y_offset)
-                    .bind(l.width)
-                    .bind(l.height)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-                }
-            }
-
-            for item in items {
-                let opts = serialize_superjson(&item.options)?;
-                let adv = serialize_superjson(&item.advanced_options)?;
-                let res = sqlx::query(
-                    r#"INSERT INTO "item" ("id", "board_id", "kind", "options", "advanced_options")
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT ("id") DO UPDATE SET
-                         "kind" = excluded."kind",
-                         "options" = excluded."options",
-                         "advanced_options" = excluded."advanced_options"
-                       WHERE "item"."board_id" = excluded."board_id""#,
-                )
-                .bind(&item.id)
-                .bind(board_id)
-                .bind(&item.kind)
-                .bind(&opts)
-                .bind(&adv)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_err)?;
-                if res.rows_affected() != 1 {
-                    return Err(HomarrError::Conflict(format!(
-                        "Item '{}' belongs to a different board",
-                        item.id
-                    )));
-                }
-
-                for l in &item.layouts {
-                    sqlx::query(
-                        r#"INSERT INTO "item_layout" ("item_id", "section_id", "layout_id", "x_offset", "y_offset", "width", "height")
-                           VALUES (?, ?, ?, ?, ?, ?, ?)"#,
-                    )
-                    .bind(&item.id)
-                    .bind(&l.section_id)
-                    .bind(&l.layout_id)
-                    .bind(l.x_offset)
-                    .bind(l.y_offset)
-                    .bind(l.width)
-                    .bind(l.height)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-                }
-
-                for iid in &item.integration_ids {
-                    sqlx::query(
-                        r#"INSERT INTO "integration_item" ("item_id", "integration_id") VALUES (?, ?)"#,
-                    )
-                    .bind(&item.id)
-                    .bind(iid)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-                }
-            }
-
+            save_content_sqlite(&mut tx, board_id, sections, items).await?;
             tx.commit().await.map_err(map_sqlx_err)?;
         }
         Database::Postgres(pool) => {
             let mut tx = pool.begin().await.map_err(map_sqlx_err)?;
-
-            let old_item_ids: Vec<String> =
-                sqlx::query_scalar(r#"SELECT "id" FROM "item" WHERE "board_id" = $1"#)
-                    .bind(board_id)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-            let old_section_ids: Vec<String> =
-                sqlx::query_scalar(r#"SELECT "id" FROM "section" WHERE "board_id" = $1"#)
-                    .bind(board_id)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-
-            sqlx::query(
-                r#"DELETE FROM "item_layout" WHERE "item_id" IN (SELECT "id" FROM "item" WHERE "board_id" = $1)"#,
-            )
-            .bind(board_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
-            sqlx::query(
-                r#"DELETE FROM "integration_item" WHERE "item_id" IN (SELECT "id" FROM "item" WHERE "board_id" = $1)"#,
-            )
-            .bind(board_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
-            sqlx::query(
-                r#"DELETE FROM "section_layout" WHERE "section_id" IN (SELECT "id" FROM "section" WHERE "board_id" = $1)"#,
-            )
-            .bind(board_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
-
-            for old_id in &old_item_ids {
-                if !new_item_ids.contains(old_id.as_str()) {
-                    sqlx::query(r#"DELETE FROM "item" WHERE "id" = $1 AND "board_id" = $2"#)
-                        .bind(old_id)
-                        .bind(board_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(map_sqlx_err)?;
-                }
-            }
-            for old_id in &old_section_ids {
-                if !new_section_ids.contains(old_id.as_str()) {
-                    sqlx::query(r#"DELETE FROM "section" WHERE "id" = $1 AND "board_id" = $2"#)
-                        .bind(old_id)
-                        .bind(board_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(map_sqlx_err)?;
-                }
-            }
-
-            for s in sections {
-                let opts = serialize_superjson(&s.options)?;
-                let res = sqlx::query(
-                    r#"INSERT INTO "section" ("id", "board_id", "kind", "x_offset", "y_offset", "name", "options")
-                       VALUES ($1, $2, $3, $4, $5, $6, $7)
-                       ON CONFLICT ("id") DO UPDATE SET
-                         "kind" = excluded."kind",
-                         "x_offset" = excluded."x_offset",
-                         "y_offset" = excluded."y_offset",
-                         "name" = excluded."name",
-                         "options" = excluded."options"
-                       WHERE "section"."board_id" = excluded."board_id""#,
-                )
-                .bind(&s.id)
-                .bind(board_id)
-                .bind(&s.kind)
-                .bind(s.x_offset)
-                .bind(s.y_offset)
-                .bind(&s.name)
-                .bind(&opts)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_err)?;
-                if res.rows_affected() != 1 {
-                    return Err(HomarrError::Conflict(format!(
-                        "Section '{}' belongs to a different board",
-                        s.id
-                    )));
-                }
-            }
-
-            for s in sections {
-                for l in &s.layouts {
-                    sqlx::query(
-                        r#"INSERT INTO "section_layout" ("section_id", "layout_id", "parent_section_id", "x_offset", "y_offset", "width", "height")
-                           VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
-                    )
-                    .bind(&s.id)
-                    .bind(&l.layout_id)
-                    .bind(&l.parent_section_id)
-                    .bind(l.x_offset)
-                    .bind(l.y_offset)
-                    .bind(l.width)
-                    .bind(l.height)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-                }
-            }
-
-            for item in items {
-                let opts = serialize_superjson(&item.options)?;
-                let adv = serialize_superjson(&item.advanced_options)?;
-                let res = sqlx::query(
-                    r#"INSERT INTO "item" ("id", "board_id", "kind", "options", "advanced_options")
-                       VALUES ($1, $2, $3, $4, $5)
-                       ON CONFLICT ("id") DO UPDATE SET
-                         "kind" = excluded."kind",
-                         "options" = excluded."options",
-                         "advanced_options" = excluded."advanced_options"
-                       WHERE "item"."board_id" = excluded."board_id""#,
-                )
-                .bind(&item.id)
-                .bind(board_id)
-                .bind(&item.kind)
-                .bind(&opts)
-                .bind(&adv)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_err)?;
-                if res.rows_affected() != 1 {
-                    return Err(HomarrError::Conflict(format!(
-                        "Item '{}' belongs to a different board",
-                        item.id
-                    )));
-                }
-
-                for l in &item.layouts {
-                    sqlx::query(
-                        r#"INSERT INTO "item_layout" ("item_id", "section_id", "layout_id", "x_offset", "y_offset", "width", "height")
-                           VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
-                    )
-                    .bind(&item.id)
-                    .bind(&l.section_id)
-                    .bind(&l.layout_id)
-                    .bind(l.x_offset)
-                    .bind(l.y_offset)
-                    .bind(l.width)
-                    .bind(l.height)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-                }
-
-                for iid in &item.integration_ids {
-                    sqlx::query(
-                        r#"INSERT INTO "integration_item" ("item_id", "integration_id") VALUES ($1, $2)"#,
-                    )
-                    .bind(&item.id)
-                    .bind(iid)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_err)?;
-                }
-            }
-
+            save_content_pg(&mut tx, board_id, sections, items).await?;
             tx.commit().await.map_err(map_sqlx_err)?;
         }
     }
@@ -1223,110 +891,379 @@ pub async fn save_board_content(
         .ok_or_else(|| HomarrError::NotFound("Board missing after save".to_string()))
 }
 
+async fn save_content_sqlite(
+    tx: &mut sqlx::SqliteConnection,
+    board_id: &str,
+    sections: &[SaveBoardSectionInput],
+    items: &[SaveBoardItemInput],
+) -> HomarrResult<()> {
+    let new_section_ids: std::collections::HashSet<&str> =
+        sections.iter().map(|s| s.id.as_str()).collect();
+    let new_item_ids: std::collections::HashSet<&str> =
+        items.iter().map(|i| i.id.as_str()).collect();
+
+    let old_item_ids: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "id" FROM "item" WHERE "board_id" = ?"#)
+            .bind(board_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+    let old_section_ids: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "id" FROM "section" WHERE "board_id" = ?"#)
+            .bind(board_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+
+    sqlx::query(
+        r#"DELETE FROM "item_layout" WHERE "item_id" IN (SELECT "id" FROM "item" WHERE "board_id" = ?)"#,
+    )
+    .bind(board_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_err)?;
+    sqlx::query(
+        r#"DELETE FROM "integration_item" WHERE "item_id" IN (SELECT "id" FROM "item" WHERE "board_id" = ?)"#,
+    )
+    .bind(board_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_err)?;
+    sqlx::query(
+        r#"DELETE FROM "section_layout" WHERE "section_id" IN (SELECT "id" FROM "section" WHERE "board_id" = ?)"#,
+    )
+    .bind(board_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_err)?;
+
+    // Delete only items and sections actually removed so kept rows preserve
+    // `widget_secret`, `user_item_state`, and `section_collapse_state`.
+    for old_id in &old_item_ids {
+        if !new_item_ids.contains(old_id.as_str()) {
+            sqlx::query(r#"DELETE FROM "item" WHERE "id" = ? AND "board_id" = ?"#)
+                .bind(old_id)
+                .bind(board_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+        }
+    }
+    for old_id in &old_section_ids {
+        if !new_section_ids.contains(old_id.as_str()) {
+            sqlx::query(r#"DELETE FROM "section" WHERE "id" = ? AND "board_id" = ?"#)
+                .bind(old_id)
+                .bind(board_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+        }
+    }
+
+    for s in sections {
+        let opts = serialize_superjson(&s.options)?;
+        let res = sqlx::query(
+            r#"INSERT INTO "section" ("id", "board_id", "kind", "x_offset", "y_offset", "name", "options")
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT ("id") DO UPDATE SET
+                 "kind" = excluded."kind",
+                 "x_offset" = excluded."x_offset",
+                 "y_offset" = excluded."y_offset",
+                 "name" = excluded."name",
+                 "options" = excluded."options"
+               WHERE "section"."board_id" = excluded."board_id""#,
+        )
+        .bind(&s.id)
+        .bind(board_id)
+        .bind(&s.kind)
+        .bind(s.x_offset)
+        .bind(s.y_offset)
+        .bind(&s.name)
+        .bind(&opts)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?;
+        if res.rows_affected() != 1 {
+            return Err(HomarrError::Conflict(format!(
+                "Section '{}' belongs to a different board",
+                s.id
+            )));
+        }
+    }
+
+    for s in sections {
+        for l in &s.layouts {
+            sqlx::query(
+                r#"INSERT INTO "section_layout" ("section_id", "layout_id", "parent_section_id", "x_offset", "y_offset", "width", "height")
+                   VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&s.id)
+            .bind(&l.layout_id)
+            .bind(&l.parent_section_id)
+            .bind(l.x_offset)
+            .bind(l.y_offset)
+            .bind(l.width)
+            .bind(l.height)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+    }
+
+    for item in items {
+        let opts = serialize_superjson(&item.options)?;
+        let adv = serialize_superjson(&item.advanced_options)?;
+        let res = sqlx::query(
+            r#"INSERT INTO "item" ("id", "board_id", "kind", "options", "advanced_options")
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT ("id") DO UPDATE SET
+                 "kind" = excluded."kind",
+                 "options" = excluded."options",
+                 "advanced_options" = excluded."advanced_options"
+               WHERE "item"."board_id" = excluded."board_id""#,
+        )
+        .bind(&item.id)
+        .bind(board_id)
+        .bind(&item.kind)
+        .bind(&opts)
+        .bind(&adv)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?;
+        if res.rows_affected() != 1 {
+            return Err(HomarrError::Conflict(format!(
+                "Item '{}' belongs to a different board",
+                item.id
+            )));
+        }
+
+        for l in &item.layouts {
+            sqlx::query(
+                r#"INSERT INTO "item_layout" ("item_id", "section_id", "layout_id", "x_offset", "y_offset", "width", "height")
+                   VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&item.id)
+            .bind(&l.section_id)
+            .bind(&l.layout_id)
+            .bind(l.x_offset)
+            .bind(l.y_offset)
+            .bind(l.width)
+            .bind(l.height)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+
+        for iid in &item.integration_ids {
+            sqlx::query(
+                r#"INSERT INTO "integration_item" ("item_id", "integration_id") VALUES (?, ?)"#,
+            )
+            .bind(&item.id)
+            .bind(iid)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn save_content_pg(
+    tx: &mut sqlx::PgConnection,
+    board_id: &str,
+    sections: &[SaveBoardSectionInput],
+    items: &[SaveBoardItemInput],
+) -> HomarrResult<()> {
+    let new_section_ids: std::collections::HashSet<&str> =
+        sections.iter().map(|s| s.id.as_str()).collect();
+    let new_item_ids: std::collections::HashSet<&str> =
+        items.iter().map(|i| i.id.as_str()).collect();
+
+    let old_item_ids: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "id" FROM "item" WHERE "board_id" = $1"#)
+            .bind(board_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+    let old_section_ids: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "id" FROM "section" WHERE "board_id" = $1"#)
+            .bind(board_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+
+    sqlx::query(
+        r#"DELETE FROM "item_layout" WHERE "item_id" IN (SELECT "id" FROM "item" WHERE "board_id" = $1)"#,
+    )
+    .bind(board_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_err)?;
+    sqlx::query(
+        r#"DELETE FROM "integration_item" WHERE "item_id" IN (SELECT "id" FROM "item" WHERE "board_id" = $1)"#,
+    )
+    .bind(board_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_err)?;
+    sqlx::query(
+        r#"DELETE FROM "section_layout" WHERE "section_id" IN (SELECT "id" FROM "section" WHERE "board_id" = $1)"#,
+    )
+    .bind(board_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx_err)?;
+
+    for old_id in &old_item_ids {
+        if !new_item_ids.contains(old_id.as_str()) {
+            sqlx::query(r#"DELETE FROM "item" WHERE "id" = $1 AND "board_id" = $2"#)
+                .bind(old_id)
+                .bind(board_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+        }
+    }
+    for old_id in &old_section_ids {
+        if !new_section_ids.contains(old_id.as_str()) {
+            sqlx::query(r#"DELETE FROM "section" WHERE "id" = $1 AND "board_id" = $2"#)
+                .bind(old_id)
+                .bind(board_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+        }
+    }
+
+    for s in sections {
+        let opts = serialize_superjson(&s.options)?;
+        let res = sqlx::query(
+            r#"INSERT INTO "section" ("id", "board_id", "kind", "x_offset", "y_offset", "name", "options")
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT ("id") DO UPDATE SET
+                 "kind" = excluded."kind",
+                 "x_offset" = excluded."x_offset",
+                 "y_offset" = excluded."y_offset",
+                 "name" = excluded."name",
+                 "options" = excluded."options"
+               WHERE "section"."board_id" = excluded."board_id""#,
+        )
+        .bind(&s.id)
+        .bind(board_id)
+        .bind(&s.kind)
+        .bind(s.x_offset)
+        .bind(s.y_offset)
+        .bind(&s.name)
+        .bind(&opts)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?;
+        if res.rows_affected() != 1 {
+            return Err(HomarrError::Conflict(format!(
+                "Section '{}' belongs to a different board",
+                s.id
+            )));
+        }
+    }
+
+    for s in sections {
+        for l in &s.layouts {
+            sqlx::query(
+                r#"INSERT INTO "section_layout" ("section_id", "layout_id", "parent_section_id", "x_offset", "y_offset", "width", "height")
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+            )
+            .bind(&s.id)
+            .bind(&l.layout_id)
+            .bind(&l.parent_section_id)
+            .bind(l.x_offset)
+            .bind(l.y_offset)
+            .bind(l.width)
+            .bind(l.height)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+    }
+
+    for item in items {
+        let opts = serialize_superjson(&item.options)?;
+        let adv = serialize_superjson(&item.advanced_options)?;
+        let res = sqlx::query(
+            r#"INSERT INTO "item" ("id", "board_id", "kind", "options", "advanced_options")
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT ("id") DO UPDATE SET
+                 "kind" = excluded."kind",
+                 "options" = excluded."options",
+                 "advanced_options" = excluded."advanced_options"
+               WHERE "item"."board_id" = excluded."board_id""#,
+        )
+        .bind(&item.id)
+        .bind(board_id)
+        .bind(&item.kind)
+        .bind(&opts)
+        .bind(&adv)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?;
+        if res.rows_affected() != 1 {
+            return Err(HomarrError::Conflict(format!(
+                "Item '{}' belongs to a different board",
+                item.id
+            )));
+        }
+
+        for l in &item.layouts {
+            sqlx::query(
+                r#"INSERT INTO "item_layout" ("item_id", "section_id", "layout_id", "x_offset", "y_offset", "width", "height")
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+            )
+            .bind(&item.id)
+            .bind(&l.section_id)
+            .bind(&l.layout_id)
+            .bind(l.x_offset)
+            .bind(l.y_offset)
+            .bind(l.width)
+            .bind(l.height)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+
+        for iid in &item.integration_ids {
+            sqlx::query(
+                r#"INSERT INTO "integration_item" ("item_id", "integration_id") VALUES ($1, $2)"#,
+            )
+            .bind(&item.id)
+            .bind(iid)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn replace_layouts(
     db: &Database,
     board_id: &str,
     layouts: &[BoardLayoutNormInput],
 ) -> HomarrResult<Vec<LayoutRecord>> {
-    let existing_board = get_full_board_by_id(db, board_id)
+    let existing = get_full_board_by_id(db, board_id)
         .await?
-        .ok_or_else(|| HomarrError::NotFound(format!("Board {board_id} not found")))?;
+        .ok_or_else(|| HomarrError::NotFound(format!("Board {board_id} not found")))?
+        .layouts;
     let normalized = normalize_board_layout_roles(layouts);
-    let existing = existing_board.layouts;
-    let incoming_ids: std::collections::HashSet<&str> =
-        normalized.iter().map(|l| l.id.as_str()).collect();
-
     match db {
         Database::Sqlite(pool) => {
             let mut tx = pool.begin().await.map_err(map_sqlx_err)?;
-            for old in &existing {
-                if !incoming_ids.contains(old.id.as_str()) {
-                    sqlx::query(r#"DELETE FROM "layout" WHERE "id" = ? AND "board_id" = ?"#)
-                        .bind(&old.id)
-                        .bind(board_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(map_sqlx_err)?;
-                }
-            }
-            for l in &normalized {
-                let role_str = l.role.unwrap_or(LayoutRole::Custom).as_str();
-                let res = sqlx::query(
-                    r#"INSERT INTO "layout" ("id", "name", "board_id", "column_count", "left_gutter_column_count", "right_gutter_column_count", "breakpoint", "role", "resize_source")
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT ("id") DO UPDATE SET
-                       "name" = excluded."name", "column_count" = excluded."column_count",
-                       "left_gutter_column_count" = excluded."left_gutter_column_count",
-                       "right_gutter_column_count" = excluded."right_gutter_column_count",
-                       "breakpoint" = excluded."breakpoint", "role" = excluded."role",
-                       "resize_source" = excluded."resize_source"
-                       WHERE "layout"."board_id" = excluded."board_id""#,
-                )
-                .bind(&l.id)
-                .bind(&l.name)
-                .bind(board_id)
-                .bind(l.column_count)
-                .bind(l.left_gutter_column_count)
-                .bind(l.right_gutter_column_count)
-                .bind(l.breakpoint)
-                .bind(role_str)
-                .bind(&l.resize_source)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_err)?;
-                if res.rows_affected() != 1 {
-                    return Err(HomarrError::Conflict(format!(
-                        "Layout '{}' belongs to a different board",
-                        l.id
-                    )));
-                }
-            }
+            replace_layouts_sqlite(&mut tx, board_id, &existing, &normalized).await?;
             tx.commit().await.map_err(map_sqlx_err)?;
         }
         Database::Postgres(pool) => {
             let mut tx = pool.begin().await.map_err(map_sqlx_err)?;
-            for old in &existing {
-                if !incoming_ids.contains(old.id.as_str()) {
-                    sqlx::query(r#"DELETE FROM "layout" WHERE "id" = $1 AND "board_id" = $2"#)
-                        .bind(&old.id)
-                        .bind(board_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(map_sqlx_err)?;
-                }
-            }
-            for l in &normalized {
-                let role_str = l.role.unwrap_or(LayoutRole::Custom).as_str();
-                let res = sqlx::query(
-                    r#"INSERT INTO "layout" ("id", "name", "board_id", "column_count", "left_gutter_column_count", "right_gutter_column_count", "breakpoint", "role", "resize_source")
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                       ON CONFLICT ("id") DO UPDATE SET
-                       "name" = excluded."name", "column_count" = excluded."column_count",
-                       "left_gutter_column_count" = excluded."left_gutter_column_count",
-                       "right_gutter_column_count" = excluded."right_gutter_column_count",
-                       "breakpoint" = excluded."breakpoint", "role" = excluded."role",
-                       "resize_source" = excluded."resize_source"
-                       WHERE "layout"."board_id" = excluded."board_id""#,
-                )
-                .bind(&l.id)
-                .bind(&l.name)
-                .bind(board_id)
-                .bind(l.column_count as i16)
-                .bind(l.left_gutter_column_count as i16)
-                .bind(l.right_gutter_column_count as i16)
-                .bind(l.breakpoint as i16)
-                .bind(role_str)
-                .bind(&l.resize_source)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_err)?;
-                if res.rows_affected() != 1 {
-                    return Err(HomarrError::Conflict(format!(
-                        "Layout '{}' belongs to a different board",
-                        l.id
-                    )));
-                }
-            }
+            replace_layouts_pg(&mut tx, board_id, &existing, &normalized).await?;
             tx.commit().await.map_err(map_sqlx_err)?;
         }
     }
@@ -1335,6 +1272,144 @@ pub async fn replace_layouts(
         .await?
         .ok_or_else(|| HomarrError::NotFound(format!("Board {board_id} not found")))?
         .layouts)
+}
+
+/// Replaces the board's layouts and its section/item placements in one transaction.
+pub async fn replace_layouts_and_content(
+    db: &Database,
+    board_id: &str,
+    layouts: &[BoardLayoutNormInput],
+    sections: &[SaveBoardSectionInput],
+    items: &[SaveBoardItemInput],
+) -> HomarrResult<FullBoard> {
+    let existing = get_full_board_by_id(db, board_id)
+        .await?
+        .ok_or_else(|| HomarrError::NotFound(format!("Board {board_id} not found")))?
+        .layouts;
+    let normalized = normalize_board_layout_roles(layouts);
+    match db {
+        Database::Sqlite(pool) => {
+            let mut tx = pool.begin().await.map_err(map_sqlx_err)?;
+            replace_layouts_sqlite(&mut tx, board_id, &existing, &normalized).await?;
+            save_content_sqlite(&mut tx, board_id, sections, items).await?;
+            tx.commit().await.map_err(map_sqlx_err)?;
+        }
+        Database::Postgres(pool) => {
+            let mut tx = pool.begin().await.map_err(map_sqlx_err)?;
+            replace_layouts_pg(&mut tx, board_id, &existing, &normalized).await?;
+            save_content_pg(&mut tx, board_id, sections, items).await?;
+            tx.commit().await.map_err(map_sqlx_err)?;
+        }
+    }
+    get_full_board_by_id(db, board_id)
+        .await?
+        .ok_or_else(|| HomarrError::NotFound("Board missing after save".to_string()))
+}
+
+async fn replace_layouts_sqlite(
+    tx: &mut sqlx::SqliteConnection,
+    board_id: &str,
+    existing: &[LayoutRecord],
+    normalized: &[BoardLayoutNormInput],
+) -> HomarrResult<()> {
+    let incoming_ids: std::collections::HashSet<&str> =
+        normalized.iter().map(|l| l.id.as_str()).collect();
+    for old in existing {
+        if !incoming_ids.contains(old.id.as_str()) {
+            sqlx::query(r#"DELETE FROM "layout" WHERE "id" = ? AND "board_id" = ?"#)
+                .bind(&old.id)
+                .bind(board_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+        }
+    }
+    for l in normalized {
+        let role_str = l.role.unwrap_or(LayoutRole::Custom).as_str();
+        let res = sqlx::query(
+            r#"INSERT INTO "layout" ("id", "name", "board_id", "column_count", "left_gutter_column_count", "right_gutter_column_count", "breakpoint", "role", "resize_source")
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT ("id") DO UPDATE SET
+               "name" = excluded."name", "column_count" = excluded."column_count",
+               "left_gutter_column_count" = excluded."left_gutter_column_count",
+               "right_gutter_column_count" = excluded."right_gutter_column_count",
+               "breakpoint" = excluded."breakpoint", "role" = excluded."role",
+               "resize_source" = excluded."resize_source"
+               WHERE "layout"."board_id" = excluded."board_id""#,
+        )
+        .bind(&l.id)
+        .bind(&l.name)
+        .bind(board_id)
+        .bind(l.column_count)
+        .bind(l.left_gutter_column_count)
+        .bind(l.right_gutter_column_count)
+        .bind(l.breakpoint)
+        .bind(role_str)
+        .bind(&l.resize_source)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?;
+        if res.rows_affected() != 1 {
+            return Err(HomarrError::Conflict(format!(
+                "Layout '{}' belongs to a different board",
+                l.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn replace_layouts_pg(
+    tx: &mut sqlx::PgConnection,
+    board_id: &str,
+    existing: &[LayoutRecord],
+    normalized: &[BoardLayoutNormInput],
+) -> HomarrResult<()> {
+    let incoming_ids: std::collections::HashSet<&str> =
+        normalized.iter().map(|l| l.id.as_str()).collect();
+    for old in existing {
+        if !incoming_ids.contains(old.id.as_str()) {
+            sqlx::query(r#"DELETE FROM "layout" WHERE "id" = $1 AND "board_id" = $2"#)
+                .bind(&old.id)
+                .bind(board_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+        }
+    }
+    for l in normalized {
+        let role_str = l.role.unwrap_or(LayoutRole::Custom).as_str();
+        let res = sqlx::query(
+            r#"INSERT INTO "layout" ("id", "name", "board_id", "column_count", "left_gutter_column_count", "right_gutter_column_count", "breakpoint", "role", "resize_source")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT ("id") DO UPDATE SET
+               "name" = excluded."name", "column_count" = excluded."column_count",
+               "left_gutter_column_count" = excluded."left_gutter_column_count",
+               "right_gutter_column_count" = excluded."right_gutter_column_count",
+               "breakpoint" = excluded."breakpoint", "role" = excluded."role",
+               "resize_source" = excluded."resize_source"
+               WHERE "layout"."board_id" = excluded."board_id""#,
+        )
+        .bind(&l.id)
+        .bind(&l.name)
+        .bind(board_id)
+        .bind(l.column_count as i16)
+        .bind(l.left_gutter_column_count as i16)
+        .bind(l.right_gutter_column_count as i16)
+        .bind(l.breakpoint as i16)
+        .bind(role_str)
+        .bind(&l.resize_source)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?;
+        if res.rows_affected() != 1 {
+            return Err(HomarrError::Conflict(format!(
+                "Layout '{}' belongs to a different board",
+                l.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub async fn reset_layout(
@@ -1517,65 +1592,6 @@ pub async fn duplicate_board(
         section_map.insert(s.id.clone(), create_id());
     }
 
-    match db {
-        Database::Sqlite(pool) => {
-            sqlx::query(
-                r#"INSERT INTO "board" ("id", "name", "is_public", "creator_id", "page_title", "meta_title", "logo_image_url", "favicon_image_url", "background_image_url", "background_image_attachment", "background_image_repeat", "background_image_size", "primary_color", "secondary_color", "opacity", "custom_css", "icon_color", "item_radius", "disable_status")
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-            )
-            .bind(&new_board_id)
-            .bind(new_name)
-            .bind(source.board.is_public)
-            .bind(creator_id.or(source.board.creator_id.as_deref()))
-            .bind(&source.board.page_title)
-            .bind(&source.board.meta_title)
-            .bind(&source.board.logo_image_url)
-            .bind(&source.board.favicon_image_url)
-            .bind(&source.board.background_image_url)
-            .bind(&source.board.background_image_attachment)
-            .bind(&source.board.background_image_repeat)
-            .bind(&source.board.background_image_size)
-            .bind(&source.board.primary_color)
-            .bind(&source.board.secondary_color)
-            .bind(source.board.opacity)
-            .bind(&source.board.custom_css)
-            .bind(&source.board.icon_color)
-            .bind(&source.board.item_radius)
-            .bind(source.board.disable_status)
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_err)?;
-        }
-        Database::Postgres(pool) => {
-            sqlx::query(
-                r#"INSERT INTO "board" ("id", "name", "is_public", "creator_id", "page_title", "meta_title", "logo_image_url", "favicon_image_url", "background_image_url", "background_image_attachment", "background_image_repeat", "background_image_size", "primary_color", "secondary_color", "opacity", "custom_css", "icon_color", "item_radius", "disable_status")
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"#,
-            )
-            .bind(&new_board_id)
-            .bind(new_name)
-            .bind(source.board.is_public)
-            .bind(creator_id.or(source.board.creator_id.as_deref()))
-            .bind(&source.board.page_title)
-            .bind(&source.board.meta_title)
-            .bind(&source.board.logo_image_url)
-            .bind(&source.board.favicon_image_url)
-            .bind(&source.board.background_image_url)
-            .bind(&source.board.background_image_attachment)
-            .bind(&source.board.background_image_repeat)
-            .bind(&source.board.background_image_size)
-            .bind(&source.board.primary_color)
-            .bind(&source.board.secondary_color)
-            .bind(source.board.opacity)
-            .bind(&source.board.custom_css)
-            .bind(&source.board.icon_color)
-            .bind(&source.board.item_radius)
-            .bind(source.board.disable_status)
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_err)?;
-        }
-    }
-
     let norm_layouts: Vec<BoardLayoutNormInput> = source
         .layouts
         .iter()
@@ -1655,17 +1671,77 @@ pub async fn duplicate_board(
         })
         .collect();
 
-    let filled = match replace_layouts(db, &new_board_id, &norm_layouts).await {
-        Ok(_) => save_board_content(db, &new_board_id, &sections, &items).await,
-        Err(err) => Err(err),
-    };
-    if filled.is_err() {
-        // The helpers commit separately; remove the half-built copy (cascades to its children).
-        if let Err(err) = delete(db, &new_board_id).await {
-            tracing::error!("Could not remove partial board copy {new_board_id}: {err}");
+    let normalized = normalize_board_layout_roles(&norm_layouts);
+    match db {
+        Database::Sqlite(pool) => {
+            let mut tx = pool.begin().await.map_err(map_sqlx_err)?;
+            sqlx::query(
+                r#"INSERT INTO "board" ("id", "name", "is_public", "creator_id", "page_title", "meta_title", "logo_image_url", "favicon_image_url", "background_image_url", "background_image_attachment", "background_image_repeat", "background_image_size", "primary_color", "secondary_color", "opacity", "custom_css", "icon_color", "item_radius", "disable_status")
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&new_board_id)
+            .bind(new_name)
+            .bind(source.board.is_public)
+            .bind(creator_id.or(source.board.creator_id.as_deref()))
+            .bind(&source.board.page_title)
+            .bind(&source.board.meta_title)
+            .bind(&source.board.logo_image_url)
+            .bind(&source.board.favicon_image_url)
+            .bind(&source.board.background_image_url)
+            .bind(&source.board.background_image_attachment)
+            .bind(&source.board.background_image_repeat)
+            .bind(&source.board.background_image_size)
+            .bind(&source.board.primary_color)
+            .bind(&source.board.secondary_color)
+            .bind(source.board.opacity)
+            .bind(&source.board.custom_css)
+            .bind(&source.board.icon_color)
+            .bind(&source.board.item_radius)
+            .bind(source.board.disable_status)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+            replace_layouts_sqlite(&mut tx, &new_board_id, &[], &normalized).await?;
+            save_content_sqlite(&mut tx, &new_board_id, &sections, &items).await?;
+            tx.commit().await.map_err(map_sqlx_err)?;
+        }
+        Database::Postgres(pool) => {
+            let mut tx = pool.begin().await.map_err(map_sqlx_err)?;
+            sqlx::query(
+                r#"INSERT INTO "board" ("id", "name", "is_public", "creator_id", "page_title", "meta_title", "logo_image_url", "favicon_image_url", "background_image_url", "background_image_attachment", "background_image_repeat", "background_image_size", "primary_color", "secondary_color", "opacity", "custom_css", "icon_color", "item_radius", "disable_status")
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"#,
+            )
+            .bind(&new_board_id)
+            .bind(new_name)
+            .bind(source.board.is_public)
+            .bind(creator_id.or(source.board.creator_id.as_deref()))
+            .bind(&source.board.page_title)
+            .bind(&source.board.meta_title)
+            .bind(&source.board.logo_image_url)
+            .bind(&source.board.favicon_image_url)
+            .bind(&source.board.background_image_url)
+            .bind(&source.board.background_image_attachment)
+            .bind(&source.board.background_image_repeat)
+            .bind(&source.board.background_image_size)
+            .bind(&source.board.primary_color)
+            .bind(&source.board.secondary_color)
+            .bind(source.board.opacity)
+            .bind(&source.board.custom_css)
+            .bind(&source.board.icon_color)
+            .bind(&source.board.item_radius)
+            .bind(source.board.disable_status)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+            replace_layouts_pg(&mut tx, &new_board_id, &[], &normalized).await?;
+            save_content_pg(&mut tx, &new_board_id, &sections, &items).await?;
+            tx.commit().await.map_err(map_sqlx_err)?;
         }
     }
-    filled
+
+    get_full_board_by_id(db, &new_board_id)
+        .await?
+        .ok_or_else(|| HomarrError::NotFound("Board missing after duplicate".to_string()))
 }
 
 pub async fn create_board_item(

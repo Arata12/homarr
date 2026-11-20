@@ -826,7 +826,7 @@ mod tests {
             json!({ "isPublic": true }),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let stored = repos::boards::get_by_id(&state.db, &board_id)
             .await
             .unwrap()
@@ -1215,5 +1215,71 @@ mod tests {
         )
         .await;
         assert_eq!(cfg["hasApiKey"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn custom_widget_reads_search_engine_and_settings_validation() {
+        let (_state, app) = setup_test_state().await;
+        for uri in ["/api/custom-widgets", "/api/custom-widgets/missing"] {
+            let (status, _) = send_json(&app, "GET", uri, None, json!({})).await;
+            assert!(
+                matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+                "{uri}: {status}"
+            );
+        }
+
+        let admin = login_cookie(&app, "demo", "demo").await;
+        create_regular_user(&app, &admin, "cwviewer", "viewerpass1").await;
+        let viewer = login_cookie(&app, "cwviewer", "viewerpass1").await;
+        let (status, _) =
+            send_json(&app, "GET", "/api/custom-widgets", Some(&viewer), json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let engine = |tpl: &str| json!({ "name": "X", "short": "x", "iconUrl": "/i.svg", "urlTemplate": tpl, "type": "generic" });
+        for tpl in [
+            "javascript:alert(1)//%s",
+            "https://example.com/?q=",
+            "ftp://e.com/%s",
+        ] {
+            let (status, _) = send_json(
+                &app,
+                "POST",
+                "/api/search-engines",
+                Some(&admin),
+                engine(tpl),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{tpl}");
+        }
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/api/search-engines",
+            Some(&admin),
+            engine("https://example.com/?q=%s"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        for patch in [
+            json!({ "notASetting": { "a": 1 } }),
+            json!({ "user": { "enableGravatar": "yes" } }),
+            json!({ "board": { "homeBoardId": "does-not-exist" } }),
+            json!({ "analytics": { "instanceId": "x" } }),
+        ] {
+            let (status, _) =
+                send_json(&app, "PATCH", "/api/settings", Some(&admin), patch.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{patch}");
+        }
+        let (status, body) = send_json(
+            &app,
+            "PATCH",
+            "/api/settings",
+            Some(&admin),
+            json!({ "user": { "enableGravatar": false } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["user"]["enableGravatar"], json!(false));
     }
 }

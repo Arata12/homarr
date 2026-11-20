@@ -183,9 +183,73 @@ fn used_areas(areas: &[SmartHomeArea], used: &BTreeSet<Option<String>>) -> Vec<S
         .collect()
 }
 
+/// Camera snapshots get a cache-busting parameter that changes this often.
+const CAMERA_REFRESH_MS: f64 = 10_000.0;
+
+/// `getPictureUrlAsync`: entity pictures (and camera snapshots) are served through the image proxy.
+async fn picture_url(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+    raw: &RawEntityState,
+) -> Option<String> {
+    let picture = raw
+        .attributes
+        .get("entity_picture")
+        .and_then(Value::as_str)
+        .filter(|picture| !picture.is_empty())?;
+    if raw.state == "unavailable" {
+        return None;
+    }
+    let mut source = url::Url::parse(ctx.url.trim()).ok()?.join(picture).ok()?;
+    let is_camera = get_entity_domain(&raw.entity_id) == "camera";
+    let mut pairs: Vec<(String, String)> = source
+        .query_pairs()
+        .filter(|(key, _)| key != "token" && !(is_camera && (key == "width" || key == "homarr")))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if is_camera {
+        pairs.push(("width".into(), "640".into()));
+        let bucket = (raw.last_updated / CAMERA_REFRESH_MS).floor() as i64;
+        pairs.push(("homarr".into(), bucket.to_string()));
+    }
+    if pairs.is_empty() {
+        source.set_query(None);
+    } else {
+        source.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    let headers = headers(ctx)
+        .ok()?
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+    super::gotify::proxy_integration_image(rt, ctx, &source, headers).await
+}
+
+/// Attaches proxied `pictureUrl`s to `entities`, looking each one up in `states`.
+async fn attach_pictures(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+    states: &HashMap<String, RawEntityState>,
+    entities: &mut [SmartHomeEntity],
+) {
+    if rt.image_proxy.is_none() {
+        return;
+    }
+    let urls = futures_util::future::join_all(entities.iter().map(|entity| async move {
+        match states.get(&entity.id) {
+            Some(raw) => picture_url(rt, ctx, raw).await,
+            None => None,
+        }
+    }))
+    .await;
+    for (entity, url) in entities.iter_mut().zip(urls) {
+        if url.is_some() {
+            entity.attributes.picture_url = url;
+        }
+    }
+}
+
 fn to_entities(raws: &[&RawEntityState], lookup: &RegistryLookup) -> Vec<SmartHomeEntity> {
-    // The TS version also attaches `pictureUrl` through the image proxy; the proxy lives outside this crate and
-    // entity pictures need the access token, so they are not exposed.
     raws.iter()
         .map(|raw| normalize_entity(raw, &lookup.get(&raw.entity_id)))
         .collect()
@@ -205,7 +269,8 @@ pub async fn snapshot(
     let areas = normalize_areas(registry.as_ref());
     let ids = resolve_snapshot_ids(&states, &lookup, &areas, selection)?;
     let raws: Vec<&RawEntityState> = ids.iter().filter_map(|id| states.get(id)).collect();
-    let entities = to_entities(&raws, &lookup);
+    let mut entities = to_entities(&raws, &lookup);
+    attach_pictures(rt, ctx, &states, &mut entities).await;
     let mut used: BTreeSet<Option<String>> = entities
         .iter()
         .map(|entity| entity.area_id.clone())
@@ -578,7 +643,7 @@ pub async fn subscribe(
         pending_areas: None,
     };
     state.reconcile_selection(true)?;
-    flush(&mut state, &patches);
+    flush(rt, ctx, &mut state, &patches).await;
 
     let mut registry_poll = tokio::time::interval(Duration::from_secs(60));
     registry_poll.tick().await;
@@ -600,7 +665,7 @@ pub async fn subscribe(
             event = events.recv() => match event {
                 Ok(StreamEvent::Change(change)) => {
                     state.on_change(&change)?;
-                    flush(&mut state, &patches);
+                    flush(rt, ctx, &mut state, &patches).await;
                 }
                 Ok(StreamEvent::RegistryChanged) => {
                     registry_dirty_at.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_millis(100));
@@ -612,7 +677,7 @@ pub async fn subscribe(
                     // Missed events: resynchronize from the connection cache.
                     state.states = connection.states().await.map_err(conn_err(ctx))?;
                     state.reconcile_selection(true)?;
-                    flush(&mut state, &patches);
+                    flush(rt, ctx, &mut state, &patches).await;
                 }
             },
             _ = registry_poll.tick() => {
@@ -625,14 +690,20 @@ pub async fn subscribe(
                 state.lookup = RegistryLookup::new(registry.as_ref());
                 state.areas = normalize_areas(registry.as_ref());
                 state.reconcile_selection(true)?;
-                flush(&mut state, &patches);
+                flush(rt, ctx, &mut state, &patches).await;
             }
         }
     }
 }
 
-fn flush(state: &mut SubscriptionState, patches: &mpsc::UnboundedSender<SmartHomeEntityPatch>) {
-    if let Some(patch) = state.take_patch() {
+async fn flush(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+    state: &mut SubscriptionState,
+    patches: &mpsc::UnboundedSender<SmartHomeEntityPatch>,
+) {
+    if let Some(mut patch) = state.take_patch() {
+        attach_pictures(rt, ctx, &state.states, &mut patch.changed).await;
         // A closed receiver means the subscriber went away; the cancel signal ends the loop.
         let _ = patches.send(patch);
     }

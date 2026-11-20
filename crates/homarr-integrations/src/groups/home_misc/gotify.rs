@@ -33,6 +33,8 @@ struct Message {
 struct Application {
     id: i64,
     name: String,
+    #[serde(default)]
+    image: Option<String>,
 }
 
 fn headers(ctx: &IntegrationContext) -> HomarrResult<Vec<(&'static str, String)>> {
@@ -48,6 +50,50 @@ fn apply(
     headers.iter().fold(request, |request, (name, value)| {
         request.header(*name, value)
     })
+}
+
+/// Proxies `target` through the Homarr image proxy. Credentials are sent (and the integration origin trusted)
+/// only when the image lives on the integration's own origin.
+pub(crate) async fn proxy_integration_image(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+    target: &url::Url,
+    headers: HashMap<String, String>,
+) -> Option<String> {
+    let proxy = rt.image_proxy.as_ref()?;
+    if !matches!(target.scheme(), "http" | "https") {
+        return None;
+    }
+    let integration_origin = url::Url::parse(ctx.url.trim()).ok()?.origin();
+    let (headers, trusted_origin) = if target.origin() == integration_origin {
+        (headers, Some(integration_origin.ascii_serialization()))
+    } else {
+        (HashMap::new(), None)
+    };
+    proxy
+        .proxy_image(target.as_str(), headers, trusted_origin)
+        .await
+        .ok()
+}
+
+/// `getApplicationIconUrlAsync`: absolute image URLs are kept, relative paths resolve against the integration URL.
+async fn application_icon(
+    rt: &IntegrationRuntime,
+    ctx: &IntegrationContext,
+    headers: &[(&'static str, String)],
+    image: Option<&str>,
+) -> Option<String> {
+    let path = image.map(str::trim).filter(|path| !path.is_empty())?;
+    let target = match url::Url::parse(path) {
+        Ok(target) => target,
+        Err(_) if path.starts_with('/') => url(ctx, path, &[]).ok()?,
+        Err(_) => url(ctx, &format!("/{path}"), &[]).ok()?,
+    };
+    let headers = headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.clone()))
+        .collect();
+    proxy_integration_image(rt, ctx, &target, headers).await
 }
 
 pub async fn test_connection(
@@ -119,13 +165,26 @@ pub async fn notifications(
         .map_err(|err| crate::error::request_error(ctx, &err))?;
     let messages: MessagesResponse = serde_json::from_str(&text)
         .map_err(|err| HomarrError::Upstream(format!("Failed to parse Gotify response: {err}")))?;
-    map_messages(ctx, messages.messages, &applications)
+    let icons = futures_util::future::join_all(
+        applications
+            .values()
+            .map(|application| application_icon(rt, ctx, &headers, application.image.as_deref())),
+    )
+    .await;
+    let icons: HashMap<i64, String> = applications
+        .keys()
+        .copied()
+        .zip(icons)
+        .filter_map(|(id, icon)| icon.map(|icon| (id, icon)))
+        .collect();
+    map_messages(ctx, messages.messages, &applications, &icons)
 }
 
 fn map_messages(
     ctx: &IntegrationContext,
     messages: Vec<Message>,
     applications: &HashMap<i64, Application>,
+    icons: &HashMap<i64, String>,
 ) -> HomarrResult<Vec<Notification>> {
     messages
         .into_iter()
@@ -146,13 +205,11 @@ fn map_messages(
                 body: message.message,
                 content_type,
                 href: Some(messages_url(ctx, message.appid)?),
-                // The TS implementation resolves the application icon through the image proxy, which is not
-                // reachable from this crate (the icon request needs the credentials).
                 source: applications
                     .get(&message.appid)
                     .map(|application| NotificationSource {
                         name: application.name.clone(),
-                        icon_url: None,
+                        icon_url: icons.get(&message.appid).cloned(),
                     }),
             })
         })
@@ -228,9 +285,11 @@ mod tests {
             Application {
                 id: 2,
                 name: "App".into(),
+                image: None,
             },
         )]);
-        let out = map_messages(&ctx(), parsed.messages, &apps).unwrap();
+        let icons = HashMap::from([(2, "/api/image-proxy/abc".to_string())]);
+        let out = map_messages(&ctx(), parsed.messages, &apps, &icons).unwrap();
         assert_eq!(out[0].id, "7");
         assert_eq!(out[0].content_type.as_deref(), Some("text/markdown"));
         assert_eq!(
@@ -238,6 +297,10 @@ mod tests {
             Some("https://gotify.example.com/#/messages/2")
         );
         assert_eq!(out[0].source.as_ref().unwrap().name, "App");
+        assert_eq!(
+            out[0].source.as_ref().unwrap().icon_url.as_deref(),
+            Some("/api/image-proxy/abc")
+        );
         assert!(out[1].source.is_none() && out[1].content_type.is_none());
     }
 }

@@ -10,10 +10,15 @@ use homarr_common::{HomarrError, HomarrResult};
 use homarr_db::{
     backup::{export_backup_json, import_backup_json, HomarrBackupBundle},
     models::AssistantConfigRecord,
-    repos::{assistant, settings, users},
+    repos::{assistant, boards, settings, users},
 };
-use serde::Deserialize;
-use serde_json::{json, Value};
+use homarr_definitions::settings::{
+    default_server_setting_json, parse_branding_settings, AnalyticsSettings, AppearanceSettings,
+    BoardServerSettings, BrandingSettings, CrawlingSettings, CultureSettings, SearchServerSettings,
+    ThemeId, UserServerSettings, WhatsNewSettings, DEFAULT_SERVER_SETTINGS_KEYS,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 
 use crate::state::AppState;
 
@@ -31,25 +36,173 @@ pub async fn patch_settings(
     Json(patch): Json<HashMap<String, Value>>,
 ) -> HomarrResult<Json<HashMap<String, Value>>> {
     admin.require_writable(state.demo_read_only_active())?;
+    // Validate every key before writing any, so a bad section can't leave a partial save.
+    let mut validated = Vec::with_capacity(patch.len());
     for (k, v) in patch {
-        let merged = match v {
-            Value::Object(patch_obj) => {
-                let mut cur = settings::get_setting(&state.db, &k).await?;
-                if let Some(cur_obj) = cur.as_object_mut() {
-                    for (sub_k, sub_v) in patch_obj {
-                        cur_obj.insert(sub_k, sub_v);
-                    }
-                    cur
-                } else {
-                    Value::Object(patch_obj)
-                }
-            }
-            other => other,
-        };
-        settings::set_setting(&state.db, &k, &merged).await?;
+        let value = validate_setting_patch(&state, &k, v).await?;
+        validated.push((k, value));
+    }
+    for (k, v) in validated {
+        settings::set_setting(&state.db, &k, &v).await?;
     }
     let updated = settings::get_all_server_settings(&state.db).await?;
     Ok(Json(updated))
+}
+
+fn bad_setting(key: &str, e: impl std::fmt::Display) -> HomarrError {
+    HomarrError::BadRequest(format!("Invalid value for setting '{key}': {e}"))
+}
+
+fn setting_to_json<T: Serialize>(key: &str, value: &T) -> HomarrResult<Value> {
+    serde_json::to_value(value).map_err(|e| HomarrError::Internal(format!("{key}: {e}")))
+}
+
+/// Defaults <- stored value <- patch, type-checked against the setting's struct.
+fn merge_typed<T: DeserializeOwned>(
+    key: &str,
+    current: &Value,
+    patch: Map<String, Value>,
+) -> HomarrResult<T> {
+    let mut merged = default_server_setting_json(key)
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(cur) = current.as_object() {
+        merged.extend(cur.clone());
+    }
+    merged.extend(patch);
+    serde_json::from_value(Value::Object(merged)).map_err(|e| bad_setting(key, e))
+}
+
+fn valid_branding_image_url(v: &str) -> bool {
+    v.chars().count() <= 2048
+        && ((v.starts_with('/') && !v.starts_with("//"))
+            || url::Url::parse(v).is_ok_and(|u| matches!(u.scheme(), "http" | "https")))
+}
+
+/// Port of serverSettings.saveSettings: known keys only, value shapes checked per key.
+async fn validate_setting_patch(state: &AppState, key: &str, value: Value) -> HomarrResult<Value> {
+    if !DEFAULT_SERVER_SETTINGS_KEYS.contains(&key) {
+        return Err(HomarrError::BadRequest(format!("Unknown setting '{key}'")));
+    }
+    let Value::Object(mut patch) = value else {
+        return Err(bad_setting(key, "value must be an object"));
+    };
+    let current = settings::get_setting(&state.db, key).await?;
+    match key {
+        "board" => {
+            // saveBoardSettingsAsync: home boards must exist and be public.
+            let b: BoardServerSettings = merge_typed(key, &current, patch)?;
+            for id in [&b.home_board_id, &b.mobile_home_board_id]
+                .into_iter()
+                .flatten()
+            {
+                let public = boards::get_by_id(&state.db, id)
+                    .await?
+                    .is_some_and(|r| r.is_public);
+                if !public {
+                    return Err(HomarrError::BadRequest(format!(
+                        "Board settings home board IDs must reference public boards: {id}"
+                    )));
+                }
+            }
+            setting_to_json(key, &b)
+        }
+        "analytics" => {
+            if let Some(k) = patch.keys().find(|k| k.as_str() != "enableGeneral") {
+                return Err(bad_setting(key, format!("unknown field '{k}'")));
+            }
+            setting_to_json(
+                key,
+                &merge_typed::<AnalyticsSettings>(key, &current, patch)?,
+            )
+        }
+        "branding" => {
+            let current = parse_branding_settings(&current);
+            let mut base = setting_to_json(key, &current)?
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            let mut auth = base
+                .get("authBranding")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            for (legacy, field) in [
+                ("showCustomAppNameOnLogin", "showAppName"),
+                ("showCustomLogoOnLogin", "showLogo"),
+                ("showCustomGreetingOnLogin", "showGreeting"),
+            ] {
+                if let Some(v) = patch.remove(legacy) {
+                    auth.insert(field.to_string(), v);
+                }
+            }
+            if let Some(ab) = patch.remove("authBranding") {
+                let Value::Object(ab) = ab else {
+                    return Err(bad_setting(key, "authBranding must be an object"));
+                };
+                auth.extend(ab);
+            }
+            base.extend(patch);
+            base.insert("authBranding".to_string(), Value::Object(auth));
+            let mut b: BrandingSettings =
+                serde_json::from_value(Value::Object(base)).map_err(|e| bad_setting(key, e))?;
+            b.app_name = b.app_name.trim().to_string();
+            b.greeting = b.greeting.trim().to_string();
+            if b.app_name.is_empty() || b.app_name.chars().count() > 80 {
+                return Err(bad_setting(key, "appName must be 1-80 characters"));
+            }
+            if b.greeting.chars().count() > 160 {
+                return Err(bad_setting(key, "greeting must be at most 160 characters"));
+            }
+            if !(0.0..=0.9).contains(&b.sign_in_background_overlay) {
+                return Err(bad_setting(key, "signInBackgroundOverlay must be 0-0.9"));
+            }
+            for url in [
+                &mut b.logo_image_url,
+                &mut b.favicon_image_url,
+                &mut b.sign_in_background_image_url,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *url = url.trim().to_string();
+                if !valid_branding_image_url(url) {
+                    return Err(bad_setting(
+                        key,
+                        "image must be an HTTP(S) URL or an app-relative path",
+                    ));
+                }
+            }
+            // shortcut: customTheme is only checked to be an object, not against customThemeSchema.
+            if b.custom_theme.as_ref().is_some_and(|t| !t.is_object()) {
+                return Err(bad_setting(key, "customTheme must be an object"));
+            }
+            if b.theme_id == ThemeId::Custom && b.custom_theme.is_none() {
+                return Err(HomarrError::BadRequest(
+                    "Save a custom theme before selecting it".into(),
+                ));
+            }
+            setting_to_json(key, &b)
+        }
+        "crawlingAndIndexing" => {
+            setting_to_json(key, &merge_typed::<CrawlingSettings>(key, &current, patch)?)
+        }
+        "user" => setting_to_json(
+            key,
+            &merge_typed::<UserServerSettings>(key, &current, patch)?,
+        ),
+        "appearance" => setting_to_json(
+            key,
+            &merge_typed::<AppearanceSettings>(key, &current, patch)?,
+        ),
+        "culture" => setting_to_json(key, &merge_typed::<CultureSettings>(key, &current, patch)?),
+        "search" => setting_to_json(
+            key,
+            &merge_typed::<SearchServerSettings>(key, &current, patch)?,
+        ),
+        "whatsNew" => setting_to_json(key, &merge_typed::<WhatsNewSettings>(key, &current, patch)?),
+        _ => Err(HomarrError::BadRequest(format!("Unknown setting '{key}'"))),
+    }
 }
 
 pub async fn get_onboarding(State(state): State<AppState>) -> HomarrResult<Json<Value>> {
@@ -73,8 +226,13 @@ pub async fn update_onboarding(
     State(state): State<AppState>,
     Json(body): Json<OnboardingBody>,
 ) -> HomarrResult<Json<Value>> {
-    if state.demo_read_only_active() {
-        return Err(HomarrError::Forbidden("Demo mode is read-only".into()));
+    // Read-only API keys and demo mode must not mutate onboarding state.
+    match &session {
+        Some(s) => s.require_writable(state.demo_read_only_active())?,
+        None if state.demo_read_only_active() => {
+            return Err(HomarrError::Forbidden("Demo mode is read-only".into()));
+        }
+        None => {}
     }
     // Anonymous onboarding is only allowed before the first user exists.
     if users::count(&state.db).await? > 0 {

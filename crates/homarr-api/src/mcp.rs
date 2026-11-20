@@ -206,7 +206,7 @@ async fn execute_mcp_tool(
                     .ok_or_else(|| HomarrError::NotFound("Board not found".into()))?,
             };
             if !homarr_auth::can_view_board(&state.db, Some(session), &full.board).await? {
-                return Err(HomarrError::Forbidden("Board access denied".into()));
+                return Err(HomarrError::NotFound("Board not found".into()));
             }
             Ok(serde_json::to_value(full).unwrap_or_default())
         }

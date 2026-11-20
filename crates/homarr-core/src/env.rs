@@ -69,6 +69,21 @@ fn parse_csv(key: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parses `^\d+[smhd]?$` into seconds; a bare number is taken as seconds.
+fn parse_duration_secs(raw: &str) -> Option<i64> {
+    let (digits, multiplier) = match raw.as_bytes().last()? {
+        b's' => (&raw[..raw.len() - 1], 1),
+        b'm' => (&raw[..raw.len() - 1], 60),
+        b'h' => (&raw[..raw.len() - 1], 60 * 60),
+        b'd' => (&raw[..raw.len() - 1], 60 * 60 * 24),
+        _ => (raw, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok()?.checked_mul(multiplier)
+}
+
 fn parse_bool_opt(key: &str) -> Option<bool> {
     let val = non_empty_env(key)?;
     match val.to_ascii_lowercase().as_str() {
@@ -302,9 +317,24 @@ impl AppConfig {
             }
         };
 
-        let auth_session_expiry_secs = non_empty_env("AUTH_SESSION_EXPIRY_TIME")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(30 * 24 * 60 * 60);
+        // Logging is not initialised yet when the config loads, so warn on stderr.
+        for unsupported in auth_providers
+            .iter()
+            .filter(|p| matches!(p.as_str(), "oidc" | "ldap"))
+        {
+            eprintln!(
+                "WARN: AUTH_PROVIDERS lists \"{unsupported}\", which this build does not support; it is ignored"
+            );
+        }
+
+        let auth_session_expiry_secs = match non_empty_env("AUTH_SESSION_EXPIRY_TIME") {
+            Some(raw) => parse_duration_secs(&raw).ok_or_else(|| {
+                HomarrError::BadRequest(format!(
+                    "AUTH_SESSION_EXPIRY_TIME must be digits with an optional s/m/h/d suffix (e.g. 30d, 12h, 3600), got \"{raw}\""
+                ))
+            })?,
+            None => 30 * 24 * 60 * 60,
+        };
 
         let docker_socket_paths = {
             let paths = parse_csv("DOCKER_SOCKET_PATHS");
@@ -462,6 +492,18 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn session_expiry_duration_parsing() {
+        assert_eq!(parse_duration_secs("30d"), Some(2_592_000));
+        assert_eq!(parse_duration_secs("12h"), Some(43_200));
+        assert_eq!(parse_duration_secs("5m"), Some(300));
+        assert_eq!(parse_duration_secs("90s"), Some(90));
+        assert_eq!(parse_duration_secs("3600"), Some(3600));
+        for bad in ["", "d", "-1d", "1.5h", "1w", " 1d", "+5"] {
+            assert_eq!(parse_duration_secs(bad), None, "{bad}");
+        }
     }
 
     #[test]

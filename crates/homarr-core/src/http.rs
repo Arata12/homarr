@@ -104,6 +104,18 @@ impl HttpClientFactory {
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .danger_accept_invalid_certs(true)
+            // Hostnames resolving to blocked IPs are dropped at connect time; IP-literal and
+            // localhost redirect targets never reach the resolver, so the policy checks them.
+            .dns_resolver(Arc::new(BlockedIpFilteringResolver))
+            .redirect(Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.error("Too many redirects");
+                }
+                match validate_outbound_url(attempt.url().as_str(), None) {
+                    Ok(_) => attempt.follow(),
+                    Err(err) => attempt.error(err.to_string()),
+                }
+            }))
             .user_agent(concat!("Homarr-Ping/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|err| HomarrError::Internal(format!("Failed to build ping client: {err}")))?;

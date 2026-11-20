@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use bollard::container::{
     ListContainersOptions, LogsOptions, RemoveContainerOptions, RestartContainerOptions,
@@ -46,6 +47,8 @@ struct EnvEndpointSpec {
     id: String,
     name: String,
     transport: EnvEndpointTransport,
+    #[serde(default = "all_capabilities")]
+    capabilities: Vec<DockerCapability>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,7 +66,224 @@ enum EnvEndpointTransport {
     Tls {
         host: String,
         port: u16,
+        #[serde(rename = "caPath")]
+        ca_path: String,
+        #[serde(rename = "certPath", default)]
+        cert_path: Option<String>,
+        #[serde(rename = "keyPath", default)]
+        key_path: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DockerCapability {
+    Inventory,
+    Logs,
+    Lifecycle,
+    Remove,
+}
+
+fn all_capabilities() -> Vec<DockerCapability> {
+    vec![
+        DockerCapability::Inventory,
+        DockerCapability::Logs,
+        DockerCapability::Lifecycle,
+        DockerCapability::Remove,
+    ]
+}
+
+fn require_capability(
+    capabilities: &[DockerCapability],
+    needed: DockerCapability,
+) -> HomarrResult<()> {
+    if capabilities.contains(&needed) {
+        return Ok(());
+    }
+    let name = format!("{needed:?}").to_lowercase();
+    Err(HomarrError::Forbidden(format!(
+        "Docker endpoint does not permit {name} access"
+    )))
+}
+
+/// Mirrors `parseDockerEndpointDescriptors`: an invalid DOCKER_ENDPOINTS is an error, never a fallback.
+fn parse_endpoint_specs(raw: &str) -> HomarrResult<Vec<EnvEndpointSpec>> {
+    let invalid = |msg: String| HomarrError::Internal(format!("Invalid DOCKER_ENDPOINTS: {msg}"));
+    let specs: Vec<EnvEndpointSpec> =
+        serde_json::from_str(raw).map_err(|e| invalid(e.to_string()))?;
+    if specs.is_empty() {
+        return Err(invalid("must be a non-empty JSON array".to_string()));
+    }
+    let unique_ids: std::collections::HashSet<&str> =
+        specs.iter().map(|spec| spec.id.as_str()).collect();
+    if unique_ids.len() != specs.len() {
+        return Err(invalid("ids must be unique".to_string()));
+    }
+    for (index, spec) in specs.iter().enumerate() {
+        if !spec.capabilities.contains(&DockerCapability::Inventory) {
+            return Err(invalid(format!(
+                "[{index}].capabilities must include inventory"
+            )));
+        }
+        match &spec.transport {
+            EnvEndpointTransport::Tcp {
+                allow_insecure: false,
+                ..
+            } => {
+                return Err(invalid(format!(
+                    "[{index}] plaintext TCP requires allowInsecure: true"
+                )));
+            }
+            EnvEndpointTransport::Tls {
+                cert_path,
+                key_path,
+                ..
+            } if cert_path.is_some() != key_path.is_some() => {
+                return Err(invalid(format!(
+                    "[{index}] TLS certPath and keyPath must be provided together"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(specs)
+}
+
+/// Docker Engine API over HTTPS with the endpoint's CA and optional client certificate.
+#[derive(Clone)]
+struct TlsDockerClient {
+    http: reqwest::Client,
+    base: String,
+}
+
+impl TlsDockerClient {
+    fn connect(
+        host: &str,
+        port: u16,
+        ca_path: &str,
+        cert_path: Option<&str>,
+        key_path: Option<&str>,
+    ) -> HomarrResult<Self> {
+        let read = |path: &str| {
+            std::fs::read(path).map_err(|e| {
+                HomarrError::Internal(format!("Failed to read Docker TLS file {path}: {e}"))
+            })
+        };
+        let tls_err =
+            |e: reqwest::Error| HomarrError::Internal(format!("Docker TLS setup failed: {e}"));
+        let ca = reqwest::Certificate::from_pem(&read(ca_path)?).map_err(tls_err)?;
+        let mut builder = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca)
+            .timeout(Duration::from_secs(120));
+        if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+            let mut pem = read(cert_path)?;
+            pem.push(b'\n');
+            pem.extend(read(key_path)?);
+            builder = builder.identity(reqwest::Identity::from_pem(&pem).map_err(tls_err)?);
+        }
+        Ok(Self {
+            http: builder.build().map_err(tls_err)?,
+            base: format!("https://{host}:{port}"),
+        })
+    }
+
+    fn container_url(&self, id: &str, suffix: &str) -> String {
+        let id: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+        format!("{}/containers/{id}{suffix}", self.base)
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder) -> HomarrResult<reqwest::Response> {
+        request
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| {
+                HomarrError::Upstream(format!("Docker request to {} failed: {e}", self.base))
+            })
+    }
+
+    async fn list(&self) -> HomarrResult<Vec<ContainerSummary>> {
+        self.send(
+            self.http
+                .get(format!("{}/containers/json?all=true", self.base)),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|e| {
+            HomarrError::Upstream(format!("Invalid Docker response from {}: {e}", self.base))
+        })
+    }
+
+    async fn has_container(&self, id: &str) -> bool {
+        self.http
+            .get(self.container_url(id, "/json"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+    }
+
+    async fn action(&self, id: &str, action: &str) -> HomarrResult<()> {
+        let request = match action {
+            "start" => self.http.post(self.container_url(id, "/start")),
+            "stop" => self.http.post(self.container_url(id, "/stop?t=10")),
+            "restart" => self.http.post(self.container_url(id, "/restart?t=10")),
+            "pause" => self.http.post(self.container_url(id, "/pause")),
+            "unpause" => self.http.post(self.container_url(id, "/unpause")),
+            "remove" => self.http.delete(self.container_url(id, "?force=true")),
+            other => {
+                return Err(HomarrError::BadRequest(format!(
+                    "Unsupported Docker container action '{other}'"
+                )));
+            }
+        };
+        self.send(request).await.map(|_| ())
+    }
+
+    async fn logs(&self, id: &str, tail: usize) -> HomarrResult<String> {
+        let url = self.container_url(id, &format!("/logs?stdout=true&stderr=true&tail={tail}"));
+        let bytes = self
+            .send(self.http.get(url))
+            .await?
+            .bytes()
+            .await
+            .map_err(|e| HomarrError::Upstream(format!("Docker log stream error: {e}")))?;
+        Ok(decode_docker_logs(&bytes))
+    }
+}
+
+enum EndpointClient {
+    Bollard(Docker),
+    Tls(TlsDockerClient),
+}
+
+impl EndpointClient {
+    async fn list(&self) -> Result<Vec<ContainerSummary>, String> {
+        match self {
+            Self::Bollard(client) => client
+                .list_containers(Some(ListContainersOptions::<String> {
+                    all: true,
+                    ..Default::default()
+                }))
+                .await
+                .map_err(|e| e.to_string()),
+            Self::Tls(client) => client.list().await.map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn has_container(&self, id: &str) -> bool {
+        match self {
+            Self::Bollard(client) => client.inspect_container(id, None).await.is_ok(),
+            Self::Tls(client) => client.has_container(id).await,
+        }
+    }
+}
+
+struct DockerEndpoint {
+    host: String,
+    capabilities: Vec<DockerCapability>,
+    client: EndpointClient,
 }
 
 #[derive(Clone)]
@@ -76,58 +296,71 @@ impl DockerService {
         Self { config }
     }
 
-    fn configured_endpoints(&self) -> Vec<(String, String, Docker)> {
-        let mut clients = Vec::new();
+    fn configured_endpoints(&self) -> HomarrResult<Vec<DockerEndpoint>> {
+        let mut endpoints = Vec::new();
 
-        if let Ok(raw) = std::env::var("DOCKER_ENDPOINTS") {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                if let Ok(specs) = serde_json::from_str::<Vec<EnvEndpointSpec>>(trimmed) {
-                    for spec in specs {
-                        match spec.transport {
-                            EnvEndpointTransport::Socket { path } => {
-                                if Path::new(&path).exists() {
-                                    if let Ok(client) =
-                                        Docker::connect_with_socket(&path, 120, API_DEFAULT_VERSION)
-                                    {
-                                        clients.push((spec.id, spec.name, client));
-                                    }
-                                }
-                            }
-                            EnvEndpointTransport::Tcp {
-                                host,
-                                port,
-                                allow_insecure,
-                            } if allow_insecure => {
-                                let addr = format!("http://{host}:{port}");
-                                if let Ok(client) =
-                                    Docker::connect_with_http(&addr, 120, API_DEFAULT_VERSION)
-                                {
-                                    clients.push((spec.id, host, client));
-                                }
-                            }
-                            EnvEndpointTransport::Tls { host, port } => {
-                                let addr = format!("http://{host}:{port}");
-                                if let Ok(client) =
-                                    Docker::connect_with_http(&addr, 120, API_DEFAULT_VERSION)
-                                {
-                                    clients.push((spec.id, host, client));
-                                }
-                            }
-                            _ => {}
+        let raw = std::env::var("DOCKER_ENDPOINTS").unwrap_or_default();
+        if !raw.trim().is_empty() {
+            let specs = parse_endpoint_specs(raw.trim()).inspect_err(
+                |err| tracing::error!(error = %err, "Failed to parse DOCKER_ENDPOINTS"),
+            )?;
+            for spec in specs {
+                let (host, client) = match spec.transport {
+                    EnvEndpointTransport::Socket { path } => {
+                        if !Path::new(&path).exists() {
+                            continue;
+                        }
+                        match Docker::connect_with_socket(&path, 120, API_DEFAULT_VERSION) {
+                            Ok(client) => (spec.name, EndpointClient::Bollard(client)),
+                            Err(_) => continue,
                         }
                     }
-                    return clients;
-                }
+                    EnvEndpointTransport::Tcp { host, port, .. } => {
+                        let addr = format!("http://{host}:{port}");
+                        match Docker::connect_with_http(&addr, 120, API_DEFAULT_VERSION) {
+                            Ok(client) => (host, EndpointClient::Bollard(client)),
+                            Err(_) => continue,
+                        }
+                    }
+                    EnvEndpointTransport::Tls {
+                        host,
+                        port,
+                        ca_path,
+                        cert_path,
+                        key_path,
+                    } => match TlsDockerClient::connect(
+                        &host,
+                        port,
+                        &ca_path,
+                        cert_path.as_deref(),
+                        key_path.as_deref(),
+                    ) {
+                        Ok(client) => (host, EndpointClient::Tls(client)),
+                        Err(err) => {
+                            tracing::warn!(endpoint = %spec.id, error = %err, "Failed to configure Docker TLS endpoint");
+                            continue;
+                        }
+                    },
+                };
+                endpoints.push(DockerEndpoint {
+                    host,
+                    capabilities: spec.capabilities,
+                    client,
+                });
             }
+            return Ok(endpoints);
         }
 
-        for (idx, socket_path) in self.config.docker_socket_paths.iter().enumerate() {
+        for socket_path in &self.config.docker_socket_paths {
             if Path::new(socket_path).exists() {
                 if let Ok(client) =
                     Docker::connect_with_socket(socket_path, 120, API_DEFAULT_VERSION)
                 {
-                    clients.push((format!("socket-{idx}"), "socket".to_string(), client));
+                    endpoints.push(DockerEndpoint {
+                        host: "socket".to_string(),
+                        capabilities: all_capabilities(),
+                        client: EndpointClient::Bollard(client),
+                    });
                 }
             }
         }
@@ -136,33 +369,31 @@ impl DockerService {
             let port = self.config.docker_ports.get(idx).copied().unwrap_or(2375);
             let addr = format!("http://{host}:{port}");
             if let Ok(client) = Docker::connect_with_http(&addr, 120, API_DEFAULT_VERSION) {
-                clients.push((format!("tcp-{idx}"), host.clone(), client));
+                endpoints.push(DockerEndpoint {
+                    host: host.clone(),
+                    capabilities: all_capabilities(),
+                    client: EndpointClient::Bollard(client),
+                });
             }
         }
 
-        clients
+        Ok(endpoints)
     }
 
     pub async fn list_containers(&self) -> HomarrResult<Vec<DockerContainerInfo>> {
-        let clients = self.configured_endpoints();
-        if clients.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut all = Vec::new();
-        for (_id, endpoint_host, client) in clients {
-            let opts = Some(ListContainersOptions::<String> {
-                all: true,
-                ..Default::default()
-            });
-            match client.list_containers(opts).await {
+        for endpoint in self.configured_endpoints()? {
+            if !endpoint.capabilities.contains(&DockerCapability::Inventory) {
+                continue;
+            }
+            match endpoint.client.list().await {
                 Ok(list) => {
                     for c in list {
-                        all.push(map_container_summary(&endpoint_host, c));
+                        all.push(map_container_summary(&endpoint.host, c));
                     }
                 }
                 Err(err) => {
-                    tracing::warn!(endpoint = %endpoint_host, error = %err, "Failed to list Docker containers");
+                    tracing::warn!(endpoint = %endpoint.host, error = %err, "Failed to list Docker containers");
                 }
             }
         }
@@ -178,7 +409,25 @@ impl DockerService {
     }
 
     pub async fn container_action(&self, id: &str, action: &str) -> HomarrResult<()> {
-        let (endpoint_host, client) = self.find_client_for_container(id).await?;
+        if !matches!(
+            action,
+            "start" | "stop" | "restart" | "pause" | "unpause" | "remove"
+        ) {
+            return Err(HomarrError::BadRequest(format!(
+                "Unsupported Docker container action '{action}'"
+            )));
+        }
+        let capability = if action == "remove" {
+            DockerCapability::Remove
+        } else {
+            DockerCapability::Lifecycle
+        };
+        let endpoint = self.find_endpoint_for_container(id, capability).await?;
+        let endpoint_host = &endpoint.host;
+        let client = match &endpoint.client {
+            EndpointClient::Bollard(client) => client,
+            EndpointClient::Tls(client) => return client.action(id, action).await,
+        };
         match action {
             "start" => client
                 .start_container(id, None::<StartContainerOptions<String>>)
@@ -227,7 +476,13 @@ impl DockerService {
 
     pub async fn container_logs(&self, id: &str, tail: usize) -> HomarrResult<String> {
         use futures_util::StreamExt;
-        let (_endpoint_host, client) = self.find_client_for_container(id).await?;
+        let endpoint = self
+            .find_endpoint_for_container(id, DockerCapability::Logs)
+            .await?;
+        let client = match &endpoint.client {
+            EndpointClient::Bollard(client) => client,
+            EndpointClient::Tls(client) => return client.logs(id, tail.min(2000)).await,
+        };
         let mut stream = client.logs(
             id,
             Some(LogsOptions::<String> {
@@ -275,16 +530,26 @@ impl DockerService {
         Ok(discovered)
     }
 
-    async fn find_client_for_container(&self, id: &str) -> HomarrResult<(String, Docker)> {
-        let clients = self.configured_endpoints();
-        for (_eid, endpoint_host, client) in clients {
-            if client.inspect_container(id, None).await.is_ok() {
-                return Ok((endpoint_host, client));
+    /// Like the original, only endpoints granting `needed` may act; a match elsewhere is Forbidden.
+    async fn find_endpoint_for_container(
+        &self,
+        id: &str,
+        needed: DockerCapability,
+    ) -> HomarrResult<DockerEndpoint> {
+        let mut denied = None;
+        for endpoint in self.configured_endpoints()? {
+            if endpoint.client.has_container(id).await {
+                match require_capability(&endpoint.capabilities, needed) {
+                    Ok(()) => return Ok(endpoint),
+                    Err(err) => denied = Some(err),
+                }
             }
         }
-        Err(HomarrError::NotFound(format!(
-            "Container '{id}' not found on any configured Docker endpoint"
-        )))
+        Err(denied.unwrap_or_else(|| {
+            HomarrError::NotFound(format!(
+                "Container '{id}' not found on any configured Docker endpoint"
+            ))
+        }))
     }
 }
 
@@ -372,5 +637,37 @@ pub fn decode_docker_logs(raw: &[u8]) -> String {
         String::from_utf8_lossy(raw).into_owned()
     } else {
         parts.concat()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_capabilities_are_parsed_and_enforced() {
+        let specs = parse_endpoint_specs(
+            r#"[{"id":"a","name":"A","transport":{"type":"socket","path":"/run/docker.sock"},"capabilities":["inventory","logs"]},
+                {"id":"b","name":"B","transport":{"type":"socket","path":"/run/podman.sock"}}]"#,
+        )
+        .unwrap();
+        assert!(require_capability(&specs[0].capabilities, DockerCapability::Logs).is_ok());
+        assert!(matches!(
+            require_capability(&specs[0].capabilities, DockerCapability::Remove),
+            Err(HomarrError::Forbidden(_))
+        ));
+        assert_eq!(specs[1].capabilities, all_capabilities());
+
+        let socket = r#""transport":{"type":"socket","path":"/s"}"#;
+        for bad in [
+            "not json".to_string(),
+            "[]".to_string(),
+            format!(r#"[{{"id":"a","name":"A",{socket},"capabilities":["logs"]}}]"#),
+            format!(r#"[{{"id":"a","name":"A",{socket},"capabilities":["inventory","root"]}}]"#),
+            r#"[{"id":"a","name":"A","transport":{"type":"tcp","host":"h","port":2375}}]"#
+                .to_string(),
+        ] {
+            assert!(parse_endpoint_specs(&bad).is_err(), "{bad}");
+        }
     }
 }
